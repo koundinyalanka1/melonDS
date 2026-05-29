@@ -952,7 +952,10 @@ vec4 CompositeLayers()
         col1 = ((col1 * eva) + (col2 * evb) + 0x10) >> 5;
     }
 
-    return vec4(vec3(col1.rgb << 2) / 255.0, 1.0);
+    // Swizzle RGB→BGR so the RGBA bytes in Framebuffer[] match the BGRA layout
+    // the libretro screen shader expects (it does .bgr to correct SoftRenderer's
+    // BGRA buffer uploaded as GL_RGBA). Our glReadPixels(GL_RGBA) path must match.
+    return vec4(vec3(col1.bgr << 2) / 255.0, 1.0);
 }
 
 void main()

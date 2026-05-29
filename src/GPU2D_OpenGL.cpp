@@ -30,6 +30,24 @@
 namespace GPU2D
 {
 
+// ── TEMP diagnostic instrumentation (C4.2 black-screen / 0x0502 hunt) ─────────
+// This renderer had NO internal glGetError checks, so a GL_INVALID_OPERATION
+// raised in the 2D frame path only surfaced downstream as the misleading
+// "0x0502 at glBindFramebuffer" from libretro/opengl.cpp's present-path CHECK_GL.
+// GL2D_CHK drains + tags the error queue per stage so the next on-device log
+// names the real failing call; GL2D_FBO logs incompleteness of the 2D FBOs
+// (which, unlike the 3D ones, were never status-checked on the real driver).
+// Logged at INFO via MELONDS_2D_LOG so it is platform-agnostic. Remove once the
+// pipeline is validated.
+#define GL2D_CHK(tag) do { GLenum e_; while ((e_ = glGetError()) != GL_NO_ERROR) \
+    MELONDS_2D_LOG("2D-GL 0x%04x @ %s", e_, (tag)); } while (0)
+static inline void GL2D_FBO(const char* tag)
+{
+    GLenum s = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (s != GL_FRAMEBUFFER_COMPLETE)
+        MELONDS_2D_LOG("2D-FBO %s INCOMPLETE 0x%04x", tag, s);
+}
+
 // Equivalent of upstream OpenGLSupport's glDefaultTexParams (absent in this
 // fork): nearest filtering, clamp-to-edge — what the DS 2D textures want.
 static void texParamsDefault(GLenum target)
@@ -431,6 +449,7 @@ void GLRenderer2D::SetScaleFactor(int scale)
         glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, OBJLayerTex[u], 0, 1);
         glFramebufferTexture(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, OBJDepthTex[u], 0);
         glDrawBuffers(2, fbassign2);
+        GL2D_FBO("OBJLayerFB");
 
         // compositor output: single RGBA8 colour target at screen scale.
         glBindTexture(GL_TEXTURE_2D, OutputTex[u]);
@@ -439,8 +458,10 @@ void GLRenderer2D::SetScaleFactor(int scale)
         glBindFramebuffer(GL_FRAMEBUFFER, OutputFB[u]);
         glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, OutputTex[u], 0);
         glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        GL2D_FBO("OutputFB");
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    GL2D_CHK("SetScaleFactor");
 }
 
 void GLRenderer2D::DeInitGL()
@@ -1650,33 +1671,57 @@ void GLRenderer2D::RenderFrame(Unit* unit)
 {
     const int num = unit->Num;
 
+    GL2D_CHK("RenderFrame:enter");   // drain errors inherited from 3D/libretro
+
     // BG layers: derive config + upload referenced VRAM/palette + pre-render
     // each active layer into its AllBGLayer texture.
-    PrerenderBGLayers(unit);
+    PrerenderBGLayers(unit);   GL2D_CHK("PrerenderBGLayers");
 
     // Sprites: scan OAM, upload OBJ VRAM/palette, rasterise the atlas, then
     // composite the OBJ layer for all 192 scanlines.
-    UpdateOAM(0, 192, unit);
-    UploadOBJVRAM(unit);
-    UploadOBJPalette(unit);
-    PrerenderSprites(unit);
+    UpdateOAM(0, 192, unit);    GL2D_CHK("UpdateOAM");
+    UploadOBJVRAM(unit);        GL2D_CHK("UploadOBJVRAM");
+    UploadOBJPalette(unit);     GL2D_CHK("UploadOBJPalette");
+    PrerenderSprites(unit);     GL2D_CHK("PrerenderSprites");
     LastSpriteLine[num] = 0;
-    DoRenderSprites(192, unit);
+    DoRenderSprites(192, unit);  GL2D_CHK("DoRenderSprites");
 
     // Composite BG + OBJ (+ 3D as BG0) into OutputTex. 3D-layer hook deferred
     // (v1): Output3DTex stays 0, so a 3D BG0 samples empty — pure-2D content is
     // correct; a 3D game's 3D plane is blank until the hook lands (§15.8).
     LastLine[num] = 0;
-    RenderScreen(0, 192, unit);
+    RenderScreen(0, 192, unit);  GL2D_CHK("RenderScreen");
 
     // v1 display: read the composited screen back into the CPU backbuffer so the
     // existing libretro (software-upload) present path shows it. To be replaced
     // by a direct OutputTex blit (no readback) once correctness is validated.
+    //
+    // Fix: RenderScreen leaves GL_DRAW_FRAMEBUFFER = OutputFB[num]. On Adreno
+    // GLES3 drivers glReadPixels returns GL_INVALID_OPERATION when read and draw
+    // are both bound to the same non-default FBO (feedback-loop guard). Unbind
+    // the draw target first so the readback has no feedback-loop conflict.
     if (Framebuffer[num])
     {
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, OutputFB[num]);
         glReadPixels(0, 0, 256, 192, GL_RGBA, GL_UNSIGNED_BYTE, Framebuffer[num]);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        GL2D_CHK("RenderFrame:readback");
+    }
+
+    // TEMP one-shot per-unit state dump: tells us whether a black screen is a
+    // forced-blank/disabled engine, no active layers, or a genuinely empty
+    // composite (centerPx = middle pixel of the read-back screen).
+    static bool dumped[2] = { false, false };
+    if (!dumped[num])
+    {
+        dumped[num] = true;
+        u32 cp = Framebuffer[num] ? Framebuffer[num][96 * 256 + 128] : 0;
+        MELONDS_2D_LOG("2D-STATE u%d DispCnt=%08X En=%d fblank=%d BGAct=%X NumSpr=%d "
+                       "Out3D=%u OutFB=%u centerPx=%08X",
+                       num, unit->DispCnt, (int)unit->Enabled,
+                       (int)!!(unit->DispCnt & (1u << 7)), BGLayerActive[num],
+                       NumSprites[num], Output3DTex, OutputFB[num], cp);
     }
 }
 
