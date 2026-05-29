@@ -117,6 +117,17 @@ private:
     // Wired to melonds_opengl_resolution at C5; C3.1 allocates at 1×.
     void SetScaleFactor(int scale);
 
+    // ── Frame driver (C4.2) ───────────────────────────────────────────────
+    // Run the whole GPU 2D pipeline for `unit` for the frame whose per-scanline
+    // config has been captured (BG prerender → sprite prerender + composite →
+    // screen composite → OutputTex), then read OutputTex back into the unit's
+    // CPU backbuffer so the existing (software) libretro display path presents
+    // it. Called from DrawScanline at the last visible scanline.
+    //
+    // v1 note: the GPU→CPU readback is a correctness-first stand-in for the real
+    // display path (bind OutputTex directly, no readback) — see §15.8/C5.
+    void RenderFrame(Unit* unit);
+
     bool GLReady = false;
 
     // LayerPre program (shared between units). The fork's

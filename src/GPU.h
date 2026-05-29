@@ -182,6 +182,12 @@ void DoSavestate(Savestate* file);
 // the `melonds_2d_renderer` core option. Default false (software 2D).
 extern bool Enable2DOpenGL;
 
+// True once GPU2D::GLRenderer2D has actually been selected AND initialised
+// (i.e. Enable2DOpenGL was on, the GL 3D path is active, and Init() succeeded).
+// The libretro display path reads this to present the GPU 2D output. Cleared on
+// any fallback to the SoftRenderer. (C4.2)
+extern bool GL2DActive;
+
 void InitRenderer(int renderer);
 void DeInitRenderer();
 void ResetRenderer();

@@ -92,6 +92,7 @@ std::unique_ptr<GPU2D::Renderer2D> GPU2D_Renderer = {};
 
 // Set from the `melonds_2d_renderer` core option; consulted by InitRenderer().
 bool Enable2DOpenGL = false;
+bool GL2DActive = false;
 
 /*
     VRAM invalidation tracking
@@ -423,14 +424,21 @@ void InitRenderer(int renderer)
     {
         auto gl2d = std::make_unique<GPU2D::GLRenderer2D>();
         if (gl2d->Init())
+        {
             GPU2D_Renderer = std::move(gl2d);
+            GL2DActive = true;
+        }
         else
+        {
             GPU2D_Renderer = std::make_unique<GPU2D::SoftRenderer>();
+            GL2DActive = false;
+        }
     }
     else
 #endif
     {
         GPU2D_Renderer = std::make_unique<GPU2D::SoftRenderer>();
+        GL2DActive = false;
     }
 
     Renderer = renderer;

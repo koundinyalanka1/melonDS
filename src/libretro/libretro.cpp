@@ -665,8 +665,14 @@ static void render_frame(void)
 #ifdef HAVE_OPENGL
    if(using_opengl)
    {
-      if (current_renderer == CurrentRenderer::Software) render_opengl_frame(true);
-      else render_opengl_frame(false);
+      // GPU 2D renderer (C4.2 v1): it composites into OutputTex and reads the
+      // result back into GPU::Framebuffer, so present via the software-upload
+      // path. (The 3D GLCompositor still runs but its output is unused while
+      // GL2DActive; a direct OutputTex blit replaces this readback at C5.)
+      if (GPU::GL2DActive || current_renderer == CurrentRenderer::Software)
+         render_opengl_frame(true);
+      else
+         render_opengl_frame(false);
    }
    else if(!enable_opengl)
    {

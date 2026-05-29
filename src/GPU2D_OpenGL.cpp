@@ -64,8 +64,9 @@ bool GLRenderer2D::Init()
         return false;
     }
     GLReady = true;
-    MELONDS_2D_LOG("GPU2D: GL 2D renderer initialised (C2.1: resources ready, "
-                   "rendering still via software passthrough until C4)");
+    MELONDS_2D_LOG("GPU2D: GL 2D renderer ACTIVE (C4.2: BG + OBJ + compositor "
+                   "drive frames; v1 reads OutputTex back to the CPU framebuffer "
+                   "for display; 3D-layer hook + upscaling pending)");
     return true;
 }
 
@@ -500,6 +501,7 @@ void GLRenderer2D::DeInitGL()
         if (CompositorConfigUBO[u])    { glDeleteBuffers(1, &CompositorConfigUBO[u]);     CompositorConfigUBO[u] = 0; }
     }
     GLReady = false;
+    GPU::GL2DActive = false;
 }
 
 // ── Register capture (C2.2) ───────────────────────────────────────────────
@@ -1597,28 +1599,85 @@ void GLRenderer2D::RenderScreen(int ystart, int yend, Unit* unit)
     glDisable(GL_SCISSOR_TEST);
 }
 
-// ── Rendering: software passthrough until the GPU pipeline closes (C4) ─────
+// ── Rendering: the GPU 2D pipeline drives the frame (C4.2) ─────────────────
+// The fork's GPU calls, per frame: CheckWindows(line) (in StartScanline, before
+// us) then DrawScanline(line,A), DrawScanline(line,B) for line 0..191;
+// DrawSprites(line+1,*) one scanline ahead; VBlankEnd(A,B) at the start of the
+// next frame. We capture each scanline's register state in DrawScanline /
+// DrawSprites and run the whole GPU pipeline at the last visible scanline
+// (line 191), once per unit, into OutputTex — then read it back into the CPU
+// backbuffer for the libretro (software-upload) display path. The GL context is
+// current here: the GL 3D renderer renders mid-RunFrame too (at VCount==215).
 
 void GLRenderer2D::SetFramebuffer(u32* unitA, u32* unitB)
 {
     Framebuffer[0] = unitA;
     Framebuffer[1] = unitB;
-    Soft.SetFramebuffer(unitA, unitB);
 }
 
 void GLRenderer2D::DrawScanline(u32 line, Unit* unit)
 {
-    Soft.DrawScanline(line, unit);
+    if (line >= 192) return;
+
+    // Capture this scanline's BG scroll / rotscale / window / mosaic / back
+    // colour. Safe now that the SoftRenderer is out of the loop: CheckWindows()
+    // (run by the GPU before us) sets Win0/1Active and we are its only
+    // renderer-side consumer.
+    UpdateScanlineConfig((int)line, unit);
+
+    // All 192 scanlines captured for this unit → run the GPU pipeline.
+    if (line == 191)
+        RenderFrame(unit);
 }
 
 void GLRenderer2D::DrawSprites(u32 line, Unit* unit)
 {
-    Soft.DrawSprites(line, unit);
+    if (line >= 192) return;
+    // OBJ mosaic-snapped line (fork's equivalent of upstream GPU2D.OBJMosaicLine);
+    // consumed by the Sprite FS during DoRenderSprites.
+    SpriteScanlineConfig[unit->Num].uMosaicLine[line] = (s32)unit->OBJMosaicY;
 }
 
 void GLRenderer2D::VBlankEnd(Unit* unitA, Unit* unitB)
 {
-    Soft.VBlankEnd(unitA, unitB);
+    // Display capture (2D engine → VRAM) is deferred (v1); the per-frame work
+    // runs at DrawScanline(191) → RenderFrame.
+    (void)unitA;
+    (void)unitB;
+}
+
+void GLRenderer2D::RenderFrame(Unit* unit)
+{
+    const int num = unit->Num;
+
+    // BG layers: derive config + upload referenced VRAM/palette + pre-render
+    // each active layer into its AllBGLayer texture.
+    PrerenderBGLayers(unit);
+
+    // Sprites: scan OAM, upload OBJ VRAM/palette, rasterise the atlas, then
+    // composite the OBJ layer for all 192 scanlines.
+    UpdateOAM(0, 192, unit);
+    UploadOBJVRAM(unit);
+    UploadOBJPalette(unit);
+    PrerenderSprites(unit);
+    LastSpriteLine[num] = 0;
+    DoRenderSprites(192, unit);
+
+    // Composite BG + OBJ (+ 3D as BG0) into OutputTex. 3D-layer hook deferred
+    // (v1): Output3DTex stays 0, so a 3D BG0 samples empty — pure-2D content is
+    // correct; a 3D game's 3D plane is blank until the hook lands (§15.8).
+    LastLine[num] = 0;
+    RenderScreen(0, 192, unit);
+
+    // v1 display: read the composited screen back into the CPU backbuffer so the
+    // existing libretro (software-upload) present path shows it. To be replaced
+    // by a direct OutputTex blit (no readback) once correctness is validated.
+    if (Framebuffer[num])
+    {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, OutputFB[num]);
+        glReadPixels(0, 0, 256, 192, GL_RGBA, GL_UNSIGNED_BYTE, Framebuffer[num]);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    }
 }
 
 }
