@@ -14,6 +14,7 @@
 #include "GPU2D_OpenGL.h"
 #include "GPU2D_OpenGL_shaders.h"
 #include "GPU.h"
+#include "GPU3D.h"
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -149,6 +150,172 @@ void GLRenderer2D::DeInitGL()
         if (ScanlineConfigUBO[u]) { glDeleteBuffers(1, &ScanlineConfigUBO[u]);  ScanlineConfigUBO[u] = 0; }
     }
     GLReady = false;
+}
+
+// ── Register capture (C2.2) ───────────────────────────────────────────────
+// Ported from upstream GLRenderer2D::UpdateScanlineConfig, adapted to this
+// fork's per-Unit API:
+//   GPU2D.x              -> unit->x
+//   GPU.GPU3D.GetRenderXPos() -> GPU3D::RenderXPos
+//   GPU2D.BGMosaicLine   -> (line - unit->BGMosaicY)   [fork SoftRenderer does
+//                            yoff = BGYPos + line; yoff -= BGMosaicY]
+//   GPU.Palette          -> GPU::Palette
+// Not called during software passthrough (mutates window-tracking state).
+void GLRenderer2D::UpdateScanlineConfig(int line, Unit* unit)
+{
+    auto& cfg = ScanlineConfig[unit->Num].uScanline[line];
+
+    u32 bgmode = unit->DispCnt & 0x7;
+    bool xmosaic = (unit->BGMosaicSize[0] > 0);
+    int mosaicLine = line - (int)unit->BGMosaicY;
+
+    if (unit->DispCnt & (1<<3))
+    {
+        // 3D layer
+        int xpos = GPU3D::RenderXPos & 0x1FF;
+        cfg.BGOffset[0][0] = xpos - ((xpos & 0x100) << 1);
+        cfg.BGOffset[0][1] = line;
+        cfg.BGMosaicEnable[0] = false;
+    }
+    else
+    {
+        // text layer
+        cfg.BGOffset[0][0] = unit->BGXPos[0];
+        if (unit->BGCnt[0] & (1<<6))
+        {
+            cfg.BGOffset[0][1] = unit->BGYPos[0] + mosaicLine;
+            cfg.BGMosaicEnable[0] = xmosaic;
+        }
+        else
+        {
+            cfg.BGOffset[0][1] = unit->BGYPos[0] + line;
+            cfg.BGMosaicEnable[0] = false;
+        }
+    }
+
+    // BG1 — always a text layer
+    cfg.BGOffset[1][0] = unit->BGXPos[1];
+    if (unit->BGCnt[1] & (1<<6))
+    {
+        cfg.BGOffset[1][1] = unit->BGYPos[1] + mosaicLine;
+        cfg.BGMosaicEnable[1] = xmosaic;
+    }
+    else
+    {
+        cfg.BGOffset[1][1] = unit->BGYPos[1] + line;
+        cfg.BGMosaicEnable[1] = false;
+    }
+
+    if ((bgmode == 2) || (bgmode >= 4 && bgmode <= 6))
+    {
+        // BG2 rotscale layer
+        cfg.BGOffset[2][0] = unit->BGXRefInternal[0];
+        cfg.BGOffset[2][1] = unit->BGYRefInternal[0];
+        cfg.BGRotscale[0][0] = unit->BGRotA[0];
+        cfg.BGRotscale[0][1] = unit->BGRotB[0];
+        cfg.BGRotscale[0][2] = unit->BGRotC[0];
+        cfg.BGRotscale[0][3] = unit->BGRotD[0];
+    }
+    else
+    {
+        // BG2 text layer
+        cfg.BGOffset[2][0] = unit->BGXPos[2];
+        if (unit->BGCnt[2] & (1<<6))
+            cfg.BGOffset[2][1] = unit->BGYPos[2] + mosaicLine;
+        else
+            cfg.BGOffset[2][1] = unit->BGYPos[2] + line;
+    }
+    cfg.BGMosaicEnable[2] = (unit->BGCnt[2] & (1<<6)) ? xmosaic : false;
+
+    if (bgmode >= 1 && bgmode <= 5)
+    {
+        // BG3 rotscale layer
+        cfg.BGOffset[3][0] = unit->BGXRefInternal[1];
+        cfg.BGOffset[3][1] = unit->BGYRefInternal[1];
+        cfg.BGRotscale[1][0] = unit->BGRotA[1];
+        cfg.BGRotscale[1][1] = unit->BGRotB[1];
+        cfg.BGRotscale[1][2] = unit->BGRotC[1];
+        cfg.BGRotscale[1][3] = unit->BGRotD[1];
+    }
+    else
+    {
+        // BG3 text layer
+        cfg.BGOffset[3][0] = unit->BGXPos[3];
+        if (unit->BGCnt[3] & (1<<6))
+            cfg.BGOffset[3][1] = unit->BGYPos[3] + mosaicLine;
+        else
+            cfg.BGOffset[3][1] = unit->BGYPos[3] + line;
+    }
+    cfg.BGMosaicEnable[3] = (unit->BGCnt[3] & (1<<6)) ? xmosaic : false;
+
+    u16* pal = (u16*)&GPU::Palette[unit->Num ? 0x400 : 0];
+    cfg.BackColor = pal[0];
+
+    // mosaic sizes
+    cfg.MosaicSize[0] = unit->BGMosaicSize[0];
+    cfg.MosaicSize[1] = unit->BGMosaicSize[1];
+    cfg.MosaicSize[2] = unit->OBJMosaicSize[0];
+    cfg.MosaicSize[3] = unit->OBJMosaicSize[1];
+
+    // windows
+    if (unit->DispCnt & 0xE000) cfg.WinRegs = unit->WinCnt[2];
+    else                        cfg.WinRegs = 0xFF;
+    if (unit->DispCnt & (1<<15)) cfg.WinRegs |= (unit->WinCnt[3] << 8);
+    else                         cfg.WinRegs |= 0xFF00;
+    if (unit->DispCnt & (1<<14)) cfg.WinRegs |= (unit->WinCnt[1] << 16);
+    else                         cfg.WinRegs |= 0xFF0000;
+    if (unit->DispCnt & (1<<13)) cfg.WinRegs |= (unit->WinCnt[0] << 24);
+    else                         cfg.WinRegs |= 0xFF000000;
+
+    cfg.WinMask = 0;
+
+    if ((unit->DispCnt & (1<<13)) && (unit->Win0Active & 0x1))
+    {
+        int x0 = unit->Win0Coords[0];
+        int x1 = unit->Win0Coords[1];
+        if (x0 <= x1)
+        {
+            cfg.WinPos[0] = x0; cfg.WinPos[1] = x1;
+            if (unit->Win0Active == 0x3) cfg.WinMask |= (1<<0);
+            cfg.WinMask |= (1<<1);
+            unit->Win0Active &= ~0x2;
+        }
+        else
+        {
+            cfg.WinPos[0] = x1; cfg.WinPos[1] = x0;
+            if (unit->Win0Active == 0x3) cfg.WinMask |= (1<<0);
+            cfg.WinMask |= (1<<2);
+            unit->Win0Active |= 0x2;
+        }
+    }
+    else
+    {
+        cfg.WinPos[0] = 256; cfg.WinPos[1] = 256;
+    }
+
+    if ((unit->DispCnt & (1<<14)) && (unit->Win1Active & 0x1))
+    {
+        int x0 = unit->Win1Coords[0];
+        int x1 = unit->Win1Coords[1];
+        if (x0 <= x1)
+        {
+            cfg.WinPos[2] = x0; cfg.WinPos[3] = x1;
+            if (unit->Win1Active == 0x3) cfg.WinMask |= (1<<3);
+            cfg.WinMask |= (1<<4);
+            unit->Win1Active &= ~0x2;
+        }
+        else
+        {
+            cfg.WinPos[2] = x1; cfg.WinPos[3] = x0;
+            if (unit->Win1Active == 0x3) cfg.WinMask |= (1<<3);
+            cfg.WinMask |= (1<<5);
+            unit->Win1Active |= 0x2;
+        }
+    }
+    else
+    {
+        cfg.WinPos[2] = 256; cfg.WinPos[3] = 256;
+    }
 }
 
 // ── Rendering: software passthrough until the GPU pipeline closes (C4) ─────

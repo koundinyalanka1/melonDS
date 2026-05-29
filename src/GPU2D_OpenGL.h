@@ -55,6 +55,14 @@ private:
     bool InitResources();   // textures / FBOs / UBOs for both units
     void DeInitGL();
 
+    // ── Register capture (C2.2) ───────────────────────────────────────────
+    // Capture per-scanline DS 2D register state for `unit` into
+    // ScanlineConfig[unit->Num].uScanline[line]. NOTE: mutates the unit's
+    // Win0Active/Win1Active window-tracking state, which the SoftRenderer also
+    // owns — so this is only safe to call once the GPU render path has replaced
+    // the software passthrough (C4); not wired during passthrough.
+    void UpdateScanlineConfig(int line, Unit* unit);
+
     bool GLReady = false;
 
     // LayerPre program (shared between units). The fork's
