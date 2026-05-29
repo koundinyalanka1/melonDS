@@ -22,6 +22,9 @@
 #include "GPU.h"
 
 #include "GPU2D_Soft.h"
+#ifdef OGLRENDERER_ENABLED
+#include "GPU2D_OpenGL.h"
+#endif
 
 namespace GPU
 {
@@ -86,6 +89,9 @@ GPU2D::Unit GPU2D_A(0);
 GPU2D::Unit GPU2D_B(1);
 
 std::unique_ptr<GPU2D::Renderer2D> GPU2D_Renderer = {};
+
+// Set from the `melonds_2d_renderer` core option; consulted by InitRenderer().
+bool Enable2DOpenGL = false;
 
 /*
     VRAM invalidation tracking
@@ -406,6 +412,25 @@ void InitRenderer(int renderer)
     {
         GPU3D::CurrentRenderer = std::make_unique<GPU3D::SoftRenderer>();
         GPU3D::CurrentRenderer->Init();
+    }
+
+    // Select the 2D renderer. The GPU 2D path is only meaningful alongside the
+    // GL 3D renderer (it shares the GL context and composites the 3D output),
+    // and only when explicitly enabled via the core option. Anything else —
+    // and any GL init failure — falls back to the CPU SoftRenderer.
+#ifdef OGLRENDERER_ENABLED
+    if (renderer == 1 && Enable2DOpenGL)
+    {
+        auto gl2d = std::make_unique<GPU2D::GLRenderer2D>();
+        if (gl2d->Init())
+            GPU2D_Renderer = std::move(gl2d);
+        else
+            GPU2D_Renderer = std::make_unique<GPU2D::SoftRenderer>();
+    }
+    else
+#endif
+    {
+        GPU2D_Renderer = std::make_unique<GPU2D::SoftRenderer>();
     }
 
     Renderer = renderer;

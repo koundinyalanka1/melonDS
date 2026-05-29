@@ -96,6 +96,7 @@ SOURCES_C += $(CORE_DIR)/libretro-common/glsm/glsm.c \
 
 SOURCES_CXX +=  $(MELON_DIR)/GPU_OpenGL.cpp \
                 $(MELON_DIR)/GPU3D_OpenGL.cpp \
+                $(MELON_DIR)/GPU2D_OpenGL.cpp \
                 $(MELON_DIR)/OpenGLSupport.cpp \
                 $(CORE_DIR)/opengl.cpp
 

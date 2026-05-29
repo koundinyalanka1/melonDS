@@ -459,6 +459,12 @@ static void check_variables(bool init)
 
          enable_opengl = use_opengl;
       }
+
+      // GPU 2D renderer (only meaningful with the GL renderer; consulted by
+      // GPU::InitRenderer). Defaults to the CPU SoftRenderer.
+      var.key = "melonds_2d_renderer";
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+         GPU::Enable2DOpenGL = !strcmp(var.value, "opengl");
    }
 
    // Running the software rendering thread at the same time as OpenGL is used will cause segfaulty on cleanup

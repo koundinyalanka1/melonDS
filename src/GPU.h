@@ -177,6 +177,11 @@ void Stop();
 
 void DoSavestate(Savestate* file);
 
+// When true and the GL 3D renderer is active, InitRenderer() builds the GPU
+// 2D renderer (GPU2D::GLRenderer2D) instead of the CPU SoftRenderer. Set from
+// the `melonds_2d_renderer` core option. Default false (software 2D).
+extern bool Enable2DOpenGL;
+
 void InitRenderer(int renderer);
 void DeInitRenderer();
 void ResetRenderer();
