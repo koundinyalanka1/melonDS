@@ -1,4 +1,8 @@
 #include <glsm/glsm.h>
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+#define CHECK_GL(msg) { GLenum err; while((err = glGetError()) != GL_NO_ERROR) { __android_log_print(ANDROID_LOG_ERROR, "melonDS-GLES", "GL ERROR: 0x%04x at %s", err, msg); } }
 
 #include "input.h"
 #include "libretro_state.h"
@@ -35,13 +39,13 @@ static GLuint ubo;
 static bool setup_opengl(void)
 {
    GPU::InitRenderer(true);
+   GPU::SetRenderSettings(true, video_settings);
 
    if (!OpenGL::BuildShaderProgram(vertex_shader, fragment_shader, shader, "LibretroShader"))
       return false;
 
    glBindAttribLocation(shader[2], 0, "vPosition");
    glBindAttribLocation(shader[2], 1, "vTexcoord");
-   glBindFragDataLocation(shader[2], 0, "oColor");
 
    if (!OpenGL::LinkShaderProgram(shader))
       return false;
@@ -67,7 +71,7 @@ static bool setup_opengl(void)
    glBufferData(GL_ARRAY_BUFFER, sizeof(screen_vertices), NULL, GL_STATIC_DRAW);
 
    glGenVertexArrays(1, &vao);
-   glBindVertexArray(vao);
+   glBindVertexArray(vao); CHECK_GL("glBindVertexArray");
    glEnableVertexAttribArray(0); // position
    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4*4, (void*)(0));
    glEnableVertexAttribArray(1); // texcoord
@@ -80,7 +84,7 @@ static bool setup_opengl(void)
    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, 256*3 + 1, 192*2, 0, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, NULL);
+   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256*3 + 1, 192*2, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 
    refresh_opengl = true;
 
@@ -98,7 +102,13 @@ static void context_reset(void)
       return;
 
    glsm_ctl(GLSM_CTL_STATE_BIND, NULL);
-   setup_opengl();
+   if (!setup_opengl())
+   {
+      glsm_ctl(GLSM_CTL_STATE_UNBIND, NULL);
+      initialized_glsm = false;
+      using_opengl = false;
+      return;
+   }
 
    if(using_opengl)
       GPU::InitRenderer(true);
@@ -171,9 +181,9 @@ void setup_opengl_frame_state(void)
    GL_ShaderConfig.cursorPos[3] = -1.0f;
 
    glBindBuffer(GL_UNIFORM_BUFFER, ubo);
-   void* unibuf = glMapBuffer(GL_UNIFORM_BUFFER, GL_WRITE_ONLY);
+   void* unibuf = glMapBufferRange(GL_UNIFORM_BUFFER, 0, sizeof(GL_ShaderConfig), GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
    if (unibuf) memcpy(unibuf, &GL_ShaderConfig, sizeof(GL_ShaderConfig));
-   glUnmapBuffer(GL_UNIFORM_BUFFER);
+   glUnmapBuffer(GL_UNIFORM_BUFFER); CHECK_GL("glUnmapBuffer");
 
    float screen_width = (float)screen_layout_data.screen_width;
    float screen_height = (float)screen_layout_data.screen_height;
@@ -363,7 +373,7 @@ void render_opengl_frame(bool sw)
    int frontbuf = GPU::FrontBuffer;
    bool virtual_cursor = cursor_enabled(&input_state);
 
-   glBindFramebuffer(GL_FRAMEBUFFER, glsm_get_current_framebuffer());
+   glBindFramebuffer(GL_FRAMEBUFFER, glsm_get_current_framebuffer()); CHECK_GL("glBindFramebuffer");
 
    if(refresh_opengl)
    {
@@ -380,18 +390,18 @@ void render_opengl_frame(bool sw)
       GL_ShaderConfig.cursorPos[3] = (((float)(input_state.touch_y) + (float)(CURSOR_SIZE)) / ((float)VIDEO_WIDTH * 1.5)) + 0.5f;
 
       glBindBuffer(GL_UNIFORM_BUFFER, ubo);
-      void* unibuf = glMapBuffer(GL_UNIFORM_BUFFER, GL_WRITE_ONLY);
+      void* unibuf = glMapBufferRange(GL_UNIFORM_BUFFER, 0, sizeof(GL_ShaderConfig), GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
       if (unibuf) memcpy(unibuf, &GL_ShaderConfig, sizeof(GL_ShaderConfig));
-      glUnmapBuffer(GL_UNIFORM_BUFFER);
+      glUnmapBuffer(GL_UNIFORM_BUFFER); CHECK_GL("glUnmapBuffer");
    }
 
-   OpenGL::UseShaderProgram(shader);
+   OpenGL::UseShaderProgram(shader); CHECK_GL("UseShaderProgram");
 
    glDisable(GL_DEPTH_TEST);
    glDisable(GL_STENCIL_TEST);
    glDisable(GL_BLEND);
 
-   glViewport(0, 0, screen_layout_data.buffer_width, screen_layout_data.buffer_height);
+   glViewport(0, 0, screen_layout_data.buffer_width, screen_layout_data.buffer_height); CHECK_GL("glViewport");
 
    glActiveTexture(GL_TEXTURE0);
 
@@ -401,15 +411,15 @@ void render_opengl_frame(bool sw)
 
       if (GPU::Framebuffer[frontbuf][0] && GPU::Framebuffer[frontbuf][1])
       {
-         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 192, GL_RGBA_INTEGER,
+         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 192, GL_RGBA,
                         GL_UNSIGNED_BYTE, GPU::Framebuffer[frontbuf][0]);
-         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 192, 256, 192, GL_RGBA_INTEGER,
+         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 192, 256, 192, GL_RGBA,
                         GL_UNSIGNED_BYTE, GPU::Framebuffer[frontbuf][1]);
       }
    }
    else
    {
-      GPU::CurGLCompositor->BindOutputTexture(frontbuf);
+      GPU::CurGLCompositor->BindOutputTexture(frontbuf); CHECK_GL("BindOutputTexture");
    }
 
    GLint filter = opengl_linear_filtering ? GL_LINEAR : GL_NEAREST;
@@ -417,8 +427,8 @@ void render_opengl_frame(bool sw)
    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
 
    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-   glBindVertexArray(vao);
-   glDrawArrays(GL_TRIANGLES, 0, screen_layout_data.hybrid_small_screen == SmallScreenLayout::SmallScreenDuplicate ? 18 : 12);
+   glBindVertexArray(vao); CHECK_GL("glBindVertexArray");
+   glDrawArrays(GL_TRIANGLES, 0, screen_layout_data.hybrid_small_screen == SmallScreenLayout::SmallScreenDuplicate ? 18 : 12); CHECK_GL("glDrawArrays");
 
    glFlush();
 

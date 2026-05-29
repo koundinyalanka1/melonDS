@@ -347,8 +347,8 @@ void rglStencilFunc(GLenum func, GLint ref, GLuint mask);
 void rglCullFace(GLenum mode);
 void rglStencilOp(GLenum sfail, GLenum dpfail, GLenum dppass);
 void rglFrontFace(GLenum mode);
-void rglDepthRange(GLclampd zNear, GLclampd zFar);
-void rglClearDepth(GLdouble depth);
+void rglDepthRange(GLclampf zNear, GLclampf zFar);
+void rglClearDepth(double depth);
 void rglPolygonOffset(GLfloat factor, GLfloat units);
 void rglDrawArrays(GLenum mode, GLint first, GLsizei count);
 void rglVertexAttrib4f(GLuint name, GLfloat x, GLfloat y,

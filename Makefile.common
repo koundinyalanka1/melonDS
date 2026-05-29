@@ -92,7 +92,7 @@ INCFLAGS    += -I$(MELON_DIR)/teakra/include -I$(MELON_DIR)/teakra/src
 ifeq ($(HAVE_OPENGL), 1)
 SOURCES_C += $(CORE_DIR)/libretro-common/glsm/glsm.c \
              $(CORE_DIR)/libretro-common/glsym/rglgen.c \
-             $(CORE_DIR)/libretro-common/glsym/glsym_gl.c
+             $(CORE_DIR)/libretro-common/glsym/glsym_es3.c
 
 SOURCES_CXX +=  $(MELON_DIR)/GPU_OpenGL.cpp \
                 $(MELON_DIR)/GPU3D_OpenGL.cpp \

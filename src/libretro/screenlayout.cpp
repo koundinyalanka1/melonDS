@@ -22,10 +22,8 @@ void update_screenlayout(ScreenLayout layout, ScreenLayoutData *data, bool openg
     if(opengl)
     {
         // To avoid some issues the size should be at least 4x the native res
-        if(video_settings.GL_ScaleFactor > 4)
-            scale = video_settings.GL_ScaleFactor;
-        else
-            scale = 4;
+        scale = video_settings.GL_ScaleFactor > 0 ? video_settings.GL_ScaleFactor : 1;
+            // YAGE: honor user scale; upstream "min 4×" floor was the TV perf killer
     }
 
     data->scale = scale;
