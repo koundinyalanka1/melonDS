@@ -16,6 +16,8 @@
 #include "GPU.h"
 #include "GPU3D.h"
 
+#include <cstring>   // memcpy / memset
+
 #ifdef __ANDROID__
 #include <android/log.h>
 #define MELONDS_2D_LOG(...) __android_log_print(ANDROID_LOG_INFO, "melonDS-GLES", __VA_ARGS__)
@@ -126,7 +128,58 @@ bool GLRenderer2D::InitResources()
         glGenBuffers(1, &ScanlineConfigUBO[u]);
         glBindBuffer(GL_UNIFORM_BUFFER, ScanlineConfigUBO[u]);
         glBufferData(GL_UNIFORM_BUFFER, sizeof(sScanlineConfig), nullptr, GL_STREAM_DRAW);
+
+        // The 22 intermediate BG layer textures (+ FBOs) per unit, sized for
+        // every possible BG layer size. Order matches upstream so BGBaseIndex
+        // selects the right slot. RGBA8 colour-renderable on GLES3.
+        static const u16 bgsizes[8][3] = {
+            { 128,  128, 2},
+            { 256,  256, 4},
+            { 256,  512, 4},
+            { 512,  256, 4},
+            { 512,  512, 4},
+            { 512, 1024, 1},
+            {1024,  512, 1},
+            {1024, 1024, 2},
+        };
+
+        glGenTextures(22, AllBGLayerTex[u]);
+        glGenFramebuffers(22, AllBGLayerFB[u]);
+
+        int l = 0;
+        for (int j = 0; j < 8; j++)
+        {
+            const u16* sz = bgsizes[j];
+            for (int k = 0; k < sz[2]; k++)
+            {
+                glBindTexture(GL_TEXTURE_2D, AllBGLayerTex[u][l]);
+                texParamsDefault(GL_TEXTURE_2D);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, sz[0], sz[1], 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+                glBindFramebuffer(GL_FRAMEBUFFER, AllBGLayerFB[u][l]);
+                glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, AllBGLayerTex[u][l], 0);
+                glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+                l++;
+            }
+        }
     }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    // Fullscreen [0,1] rect (two triangles) that the LayerPre VS expands to the
+    // current layer's clip-space quad and layer-sized texcoords.
+    static const float rectVtx[12] = {
+        0.0f, 0.0f,  1.0f, 0.0f,  1.0f, 1.0f,
+        0.0f, 0.0f,  1.0f, 1.0f,  0.0f, 1.0f,
+    };
+    glGenVertexArrays(1, &RectVtxArray);
+    glGenBuffers(1, &RectVtxBuffer);
+    glBindVertexArray(RectVtxArray);
+    glBindBuffer(GL_ARRAY_BUFFER, RectVtxBuffer);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(rectVtx), rectVtx, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);   // vPosition (bound to location 0 in InitShaders)
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+    glBindVertexArray(0);
 
     // UBO structs must be std140 16-byte aligned.
     static_assert((sizeof(sLayerConfig) & 15) == 0, "sLayerConfig not std140-aligned");
@@ -142,12 +195,16 @@ void GLRenderer2D::DeInitGL()
         glDeleteProgram(LayerPreShader[2]);
         LayerPreShader[0] = LayerPreShader[1] = LayerPreShader[2] = 0;
     }
+    if (RectVtxArray)  { glDeleteVertexArrays(1, &RectVtxArray);  RectVtxArray = 0; }
+    if (RectVtxBuffer) { glDeleteBuffers(1, &RectVtxBuffer);      RectVtxBuffer = 0; }
     for (int u = 0; u < 2; u++)
     {
         if (VRAMTex_BG[u])        { glDeleteTextures(1, &VRAMTex_BG[u]);        VRAMTex_BG[u] = 0; }
         if (PalTex_BG[u])         { glDeleteTextures(1, &PalTex_BG[u]);         PalTex_BG[u] = 0; }
         if (LayerConfigUBO[u])    { glDeleteBuffers(1, &LayerConfigUBO[u]);     LayerConfigUBO[u] = 0; }
         if (ScanlineConfigUBO[u]) { glDeleteBuffers(1, &ScanlineConfigUBO[u]);  ScanlineConfigUBO[u] = 0; }
+        if (AllBGLayerTex[u][0])  { glDeleteTextures(22, AllBGLayerTex[u]);     memset(AllBGLayerTex[u], 0, sizeof(AllBGLayerTex[u])); }
+        if (AllBGLayerFB[u][0])   { glDeleteFramebuffers(22, AllBGLayerFB[u]);  memset(AllBGLayerFB[u], 0, sizeof(AllBGLayerFB[u])); }
     }
     GLReady = false;
 }
@@ -335,6 +392,9 @@ void GLRenderer2D::UpdateLayerConfig(Unit* unit)
 {
     const int num = unit->Num;
 
+    // recomputed below: which layers get a prerendered BG texture this frame
+    BGLayerActive[num] = 0;
+
     u32 tilebase, mapbase;
     if (!num)
     {
@@ -366,6 +426,10 @@ void GLRenderer2D::UpdateLayerConfig(Unit* unit)
         int type = layertype[layer];
         if (!type) continue;
 
+        // active layer — gets a prerendered texture unless it turns out to be
+        // the 3D layer (cleared in that branch below).
+        BGLayerActive[num] |= (1u << layer);
+
         u16 bgcnt = unit->BGCnt[layer];
         auto& cfg = LayerConfig[num].uBGConfig[layer];
 
@@ -378,7 +442,8 @@ void GLRenderer2D::UpdateLayerConfig(Unit* unit)
 
         if ((layer == 0) && (unit->DispCnt & (1<<3)))
         {
-            // 3D layer
+            // 3D layer — composited from GPU3D's output (C4), not prerendered.
+            BGLayerActive[num] &= ~(1u << layer);
             cfg.Size[0] = 256; cfg.Size[1] = 192;
             cfg.Type = 6;
             cfg.Clamp = 1;
@@ -546,6 +611,138 @@ void GLRenderer2D::UpdateLayerConfig(Unit* unit)
 
     glBindBuffer(GL_UNIFORM_BUFFER, LayerConfigUBO[num]);
     glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(sLayerConfig), &LayerConfig[num]);
+}
+
+// ── Background prerender (C2.3) ────────────────────────────────────────────
+// Ported from upstream GLRenderer2D's per-frame BG pre-pass (the bgDirty/
+// LayerPre block in RenderScreen + PrerenderLayer), adapted to the fork's
+// per-Unit API. Upstream tracks dirty VRAM ranges via a bitfield; we instead
+// upload only the tile/map ranges the active layers reference (BGVRAMRange,
+// filled by UpdateLayerConfig). Driven by C4; not yet wired here.
+
+// Upload one [start, start+size) VRAM byte range into the bound R8UI texture.
+// VRAM is laid out 1024 bytes/row, so a byte range maps to whole texture rows.
+// start == 0xFFFFFFFF marks "no range" (e.g. bitmap layers have no tile range).
+static void uploadVRAMRange(const u8* vram, u32 start, u32 size, int bgheight)
+{
+    if (start == 0xFFFFFFFF || size == 0) return;
+
+    u32 limit = (u32)bgheight * 1024;
+    if (start >= limit) return;
+    u32 end = start + size;
+    if (end > limit) end = limit;
+
+    int startRow = (int)(start >> 10);
+    int endRow   = (int)((end + 1023) >> 10);
+    if (endRow > bgheight) endRow = bgheight;
+    if (endRow <= startRow) return;
+
+    glTexSubImage2D(GL_TEXTURE_2D, 0,
+                    0, startRow,
+                    1024, endRow - startRow,
+                    GL_RED_INTEGER, GL_UNSIGNED_BYTE,
+                    &vram[(size_t)startRow * 1024]);
+}
+
+void GLRenderer2D::UploadBGVRAM(Unit* unit)
+{
+    const int num = unit->Num;
+
+    u8* vram; u32 vrammask;
+    unit->GetBGVRAM(vram, vrammask);
+    int bgheight = (int)((vrammask + 1) >> 10);   // VRAM rows = texture height
+
+    glBindTexture(GL_TEXTURE_2D, VRAMTex_BG[num]);
+
+    for (int layer = 0; layer < 4; layer++)
+    {
+        if (!(BGLayerActive[num] & (1u << layer))) continue;
+        // [0]=tile start, [1]=tile size; [2]=map/bitmap start, [3]=map/bitmap size
+        uploadVRAMRange(vram, BGVRAMRange[num][layer][0], BGVRAMRange[num][layer][1], bgheight);
+        uploadVRAMRange(vram, BGVRAMRange[num][layer][2], BGVRAMRange[num][layer][3], bgheight);
+    }
+}
+
+void GLRenderer2D::UploadBGPalette(Unit* unit)
+{
+    const int num = unit->Num;
+
+    // Standard BG palette (256 entries) then the 4 ext-pal slots × 16 palettes,
+    // matching the PalTex_BG layout (rows: 0 = standard, 1.. = ext-pal).
+    static u16 temp[256 * (1 + 4 * 16)];
+    memcpy(&temp[0], &GPU::Palette[num ? 0x400 : 0], 256 * 2);
+    for (int s = 0; s < 4; s++)
+        for (int p = 0; p < 16; p++)
+        {
+            u16* pal = unit->GetBGExtPal(s, p);
+            memcpy(&temp[(1 + (s * 16) + p) * 256], pal, 256 * 2);
+        }
+
+    // GLES3 has no GL_UNSIGNED_SHORT_1_5_5_5_REV, so swizzle NDS BGR555 entries
+    // into 5_5_5_1 layout at upload time (same as the GPU3D_OpenGL palette path):
+    //   R(0x001F)<<11 | G(0x03E0)<<1 | B(0x7C00)>>9 | (top bit)->A
+    static u16 swiz[256 * (1 + 4 * 16)];
+    const int n = 256 * (1 + 4 * 16);
+    for (int i = 0; i < n; i++)
+    {
+        u16 s = temp[i];
+        swiz[i] = ((s & 0x001F) << 11) | ((s & 0x03E0) << 1) | ((s & 0x7C00) >> 9) | ((s >> 15) & 0x1);
+    }
+
+    glBindTexture(GL_TEXTURE_2D, PalTex_BG[num]);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 1 + (4 * 16),
+                    GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, swiz);
+}
+
+void GLRenderer2D::PrerenderLayer(int layer, Unit* unit)
+{
+    const int num = unit->Num;
+    auto& cfg = LayerConfig[num].uBGConfig[layer];
+
+    if (cfg.Type >= 6) return;   // 3D layer — composited from GPU3D output at C4
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, BGLayerFB[num][layer]);
+
+    glUniform1i(LayerPreCurBGULoc, layer);
+    glViewport(0, 0, cfg.Size[0], cfg.Size[1]);
+
+    glBindBuffer(GL_ARRAY_BUFFER, RectVtxBuffer);
+    glBindVertexArray(RectVtxArray);
+    glDrawArrays(GL_TRIANGLES, 0, 2 * 3);
+}
+
+void GLRenderer2D::PrerenderBGLayers(Unit* unit)
+{
+    const int num = unit->Num;
+
+    UpdateLayerConfig(unit);   // fills LayerConfig + BGVRAMRange + BGLayerActive
+
+    UploadBGVRAM(unit);
+    UploadBGPalette(unit);
+
+    if (!BGLayerActive[num]) return;
+
+    glUseProgram(LayerPreShader[2]);
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_FALSE);
+
+    glBindBufferBase(GL_UNIFORM_BUFFER, 20, LayerConfigUBO[num]);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, VRAMTex_BG[num]);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, PalTex_BG[num]);
+
+    for (int layer = 0; layer < 4; layer++)
+    {
+        if (!(BGLayerActive[num] & (1u << layer))) continue;
+        PrerenderLayer(layer, unit);
+    }
 }
 
 // ── Rendering: software passthrough until the GPU pipeline closes (C4) ─────

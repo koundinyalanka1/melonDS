@@ -69,12 +69,31 @@ private:
     // are deferred (treated as direct-colour bitmap, Type 5) until C4.
     void UpdateLayerConfig(Unit* unit);
 
+    // ── Background prerender (C2.3) ───────────────────────────────────────
+    // Build the intermediate BG layer textures for `unit`: derive the layer
+    // config, upload the VRAM regions + palette the active layers reference,
+    // then run the LayerPre program once per active text/affine/extended/bitmap
+    // layer into its selected AllBGLayer texture. The 3D layer (Type 6) is
+    // skipped here (the compositor samples GPU3D's output at C4). Like the
+    // config-capture helpers above, this is NOT yet wired into the render path
+    // — the software passthrough still drives displayed pixels until C4.
+    void PrerenderBGLayers(Unit* unit);
+    void PrerenderLayer(int layer, Unit* unit);
+    void UploadBGVRAM(Unit* unit);     // VRAM regions referenced by active layers
+    void UploadBGPalette(Unit* unit);  // standard + extended BG palette (swizzled)
+
     bool GLReady = false;
 
     // LayerPre program (shared between units). The fork's
     // OpenGL::BuildShaderProgram fills a GLuint[3] = {vs, fs, program}.
     GLuint LayerPreShader[3] = {0, 0, 0};
     GLint  LayerPreCurBGULoc = -1;
+
+    // fullscreen [0,1] rect that drives the LayerPre program (shared, not
+    // per-unit). vPosition spans 0..1; the VS maps it to clip space and to
+    // layer-sized texcoords.
+    GLuint RectVtxBuffer = 0;
+    GLuint RectVtxArray  = 0;
 
     // ── std140 config structs (BG subset for C2) ─────────────────────────
     struct sBGConfig
@@ -126,6 +145,11 @@ private:
     GLuint BGLayerTex[2][4] = {};
     GLuint BGLayerFB[2][4]  = {};
     u32    BGVRAMRange[2][4][4] = {};
+
+    // bitmask of BG layers that UpdateLayerConfig prepared a prerendered layer
+    // texture for (i.e. active, non-3D). Drives which layers PrerenderBGLayers
+    // uploads VRAM for and dispatches the LayerPre program over.
+    u32    BGLayerActive[2] = {0, 0};
 
     // C1/C2 passthrough backend (correctness fallback until C4 closes the loop).
     SoftRenderer Soft;
