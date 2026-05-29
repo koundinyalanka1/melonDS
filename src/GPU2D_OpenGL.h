@@ -82,6 +82,41 @@ private:
     void UploadBGVRAM(Unit* unit);     // VRAM regions referenced by active layers
     void UploadBGPalette(Unit* unit);  // standard + extended BG palette (swizzled)
 
+    // ── Sprites (C3.1) ────────────────────────────────────────────────────
+    // Ported from upstream GLRenderer2D's OBJ pipeline, adapted to the fork's
+    // per-Unit API. Like the BG helpers above, these are compiled + validated
+    // but NOT yet wired into the render path — software passthrough still drives
+    // displayed pixels until C4. OBJ display-capture (sprite Type 3/4) is
+    // deferred (the fork has no GetCaptureInfo_OBJ), mirroring the BG capture
+    // deferral; bitmap sprites stay direct-colour (Type 2) until C4.
+    //
+    // Scan OAM for `unit`, build the per-OBJ config (SpriteConfig[unit->Num]),
+    // and upload it to the sprite UBO. Sets NumSprites / SpriteUseMosaic.
+    void UpdateOAM(int ystart, int yend, Unit* unit);
+    // Rasterise each non-bitmap OBJ into the 1024×512 sprite atlas (SpriteTex).
+    void PrerenderSprites(Unit* unit);
+    void UploadOBJVRAM(Unit* unit);    // OBJ VRAM (whole) → integer texture
+    void UploadOBJPalette(Unit* unit); // standard + ext OBJ palette (swizzled)
+    // Composite the atlas into the OBJ layer (OBJLayerTex) for lines
+    // [LastSpriteLine, line): two-pass mosaic + window/opaque passes via depth.
+    void DoRenderSprites(int line, Unit* unit);
+    // One sprite draw pass (window=OBJ-window sprites, else normal sprites).
+    void RenderSprites(bool window, int ystart, int yend, Unit* unit);
+
+    // ── Compositor (C4.1) ─────────────────────────────────────────────────
+    // Derive the per-frame compositor config (BG priorities, OBJ/3D enable,
+    // blend mode + coefficients) from `unit`'s registers and upload it.
+    void UpdateCompositorConfig(Unit* unit);
+    // Composite BG + OBJ layers for scanlines [ystart, yend) into OutputTex,
+    // applying windows / colour effects / mosaic / back colour. Samples the
+    // GPU3D output (Output3DTex) as BG0 when the 3D layer is enabled. This is
+    // where the GPU 2D pipeline produces visible pixels — driven at C4.2.
+    void RenderScreen(int ystart, int yend, Unit* unit);
+
+    // Size the (upscaled) OBJ render target + compositor output to `scale`×.
+    // Wired to melonds_opengl_resolution at C5; C3.1 allocates at 1×.
+    void SetScaleFactor(int scale);
+
     bool GLReady = false;
 
     // LayerPre program (shared between units). The fork's
@@ -94,6 +129,38 @@ private:
     // layer-sized texcoords.
     GLuint RectVtxBuffer = 0;
     GLuint RectVtxArray  = 0;
+
+    // ── Sprite programs (C3.1, shared between units) ──────────────────────
+    GLuint SpritePreShader[3]   = {0, 0, 0};   // rasterise OBJ → atlas
+    GLuint SpriteShader[3]      = {0, 0, 0};   // composite atlas → OBJ layer
+    GLint  SpriteRenderTransULoc = -1;
+
+    // ── Compositor program (C4.1, shared between units) ───────────────────
+    GLuint CompositorShader[3]  = {0, 0, 0};   // BG+OBJ → OutputTex
+    GLint  CompositorScaleULoc  = -1;
+
+    // OBJ→atlas vertex stream (2× pos + sprite index, per OBJ), and the
+    // atlas→OBJ-layer stream (2× pos + 2× texcoord + index). Shared scratch
+    // reused per unit (each unit is processed to completion before the next).
+    GLuint SpritePreVtxBuffer = 0;
+    GLuint SpritePreVtxArray  = 0;
+    u16*   SpritePreVtxData   = nullptr;
+    GLuint SpriteVtxBuffer    = 0;
+    GLuint SpriteVtxArray     = 0;
+    u16*   SpriteVtxData      = nullptr;
+
+    // 16×256 mosaic lookup texture (R8I), shared. Built in InitShaders.
+    GLuint MosaicTex = 0;
+
+    // 1×1 dummy 2D-array bound to the Sprite FS's deferred capture samplers
+    // (Capture128/256Tex) so DoRenderSprites stays GL-valid until C4 adds
+    // real display-capture textures.
+    GLuint DummyTexArray = 0;
+
+    // upscale factor for the OBJ render target + compositor output.
+    int ScaleFactor = 1;
+    int ScreenW = 256;
+    int ScreenH = 192;
 
     // ── std140 config structs (BG subset for C2) ─────────────────────────
     struct sBGConfig
@@ -130,6 +197,54 @@ private:
         sScanline uScanline[192];
     } ScanlineConfig[2];
 
+    // std140 layout for the sprite shaders' ubSpriteConfig (matches the
+    // sOAM/ubSpriteConfig block in GPU2D_OpenGL_shaders.h). The shader reads
+    // Flip/Mosaic as bvec2/bool — stored as 0/1 ints here. sOAM is 64 bytes
+    // (std140 array stride 64); uRotscale[32] ivec4 follows uVRAMMask+pad[3].
+    struct sSpriteConfig
+    {
+        u32 uVRAMMask;
+        u32 __pad0[3];
+        s32 uRotscale[32][4];
+        struct sOAM
+        {
+            s32 Position[2];
+            s32 Flip[2];
+            s32 Size[2];
+            s32 BoundSize[2];
+            u32 OBJMode;
+            u32 Type;
+            u32 PalOffset;
+            u32 TileOffset;
+            u32 TileStride;
+            u32 Rotscale;
+            u32 BGPrio;
+            u32 Mosaic;
+        } uOAM[128];
+    } SpriteConfig[2];
+
+    // per-scanline OBJ mosaic line (the mosaic-snapped Y for each scanline).
+    // Shader declares this packed as ivec4[48]; s32[192] is the same 768 bytes.
+    struct sSpriteScanlineConfig
+    {
+        s32 uMosaicLine[192];
+    } SpriteScanlineConfig[2];
+
+    int  NumSprites[2]     = {0, 0};
+    bool SpriteUseMosaic[2] = {false, false};
+
+    // std140 layout for the compositor's ubCompositorConfig (matches the block
+    // in GPU2D_OpenGL_shaders.h: ivec4 uBGPrio; bool×2; int×2; ivec3 coef).
+    struct sCompositorConfig
+    {
+        u32 uBGPrio[4];
+        u32 uEnableOBJ;
+        u32 uEnable3D;
+        u32 uBlendCnt;
+        u32 uBlendEffect;
+        u32 uBlendCoef[4];   // [0]=EVA [1]=EVB [2]=EVY ([3] pads to vec4)
+    } CompositorConfig[2];
+
     // ── Per-unit GL resources (indexed by unit->Num) ──────────────────────
     GLuint VRAMTex_BG[2]        = {0, 0};
     GLuint PalTex_BG[2]         = {0, 0};
@@ -150,6 +265,37 @@ private:
     // texture for (i.e. active, non-3D). Drives which layers PrerenderBGLayers
     // uploads VRAM for and dispatches the LayerPre program over.
     u32    BGLayerActive[2] = {0, 0};
+
+    // ── Per-unit OBJ GL resources (indexed by unit->Num) ──────────────────
+    GLuint VRAMTex_OBJ[2]            = {0, 0};   // raw OBJ VRAM, R8UI
+    GLuint PalTex_OBJ[2]             = {0, 0};   // std + 16 ext-pal, RGB5_A1
+    GLuint SpriteConfigUBO[2]        = {0, 0};
+    GLuint SpriteScanlineConfigUBO[2] = {0, 0};
+
+    // 1024×512 RGBA8 atlas (16×8 grid of 64×64 cells) the OBJs prerender into.
+    GLuint SpriteTex[2] = {0, 0};
+    GLuint SpriteFB[2]  = {0, 0};
+
+    // upscaled OBJ layer: 2D-array, layer 0 = colour, layer 1 = flags (MRT),
+    // plus a depth texture for priority resolution.
+    GLuint OBJLayerTex[2]  = {0, 0};
+    GLuint OBJDepthTex[2]  = {0, 0};
+    GLuint OBJLayerFB[2]   = {0, 0};
+
+    // first sprite scanline composited so far this frame (per unit).
+    int    LastSpriteLine[2] = {0, 0};
+
+    // ── Compositor output, per unit (C4.1) ────────────────────────────────
+    GLuint CompositorConfigUBO[2] = {0, 0};
+    GLuint OutputTex[2] = {0, 0};   // final composited screen (RGBA8, scaled)
+    GLuint OutputFB[2]  = {0, 0};
+    // first scanline not yet composited this frame (per unit).
+    int    LastLine[2]  = {0, 0};
+
+    // GPU3D's colour output, sampled as BG0 when the 3D layer is enabled. Set
+    // by the driver at C4.2 (= GPU3D_OpenGL FramebufferTex[GPU::FrontBuffer]);
+    // 0 until then. RenderScreen binds it to BGLayerTex[0] when DispCnt&(1<<3).
+    GLuint Output3DTex = 0;
 
     // C1/C2 passthrough backend (correctness fallback until C4 closes the loop).
     SoftRenderer Soft;
