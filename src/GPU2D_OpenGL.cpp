@@ -318,6 +318,236 @@ void GLRenderer2D::UpdateScanlineConfig(int line, Unit* unit)
     }
 }
 
+// base index for a BG layer within the AllBGLayer texture arrays, indexed by
+// [BG type][BG size] (from upstream GLRenderer2D::BGBaseIndex).
+static const u8 BGBaseIndex[4][4] = {
+    {2, 10, 6, 14},     // text mode
+    {0, 4, 16, 20},     // rotscale
+    {0, 4, 12, 16},     // bitmap
+    {18, 19, 12, 16},   // large bitmap
+};
+
+// Ported from upstream GLRenderer2D::UpdateLayerConfig, adapted to the fork's
+// per-Unit API. Display-capture BG types (7/8) are deferred — treated as a
+// plain direct-colour bitmap (Type 5) — so we don't depend on the modern
+// GetCaptureInfo_BG(); revisit when wiring capture in C4.
+void GLRenderer2D::UpdateLayerConfig(Unit* unit)
+{
+    const int num = unit->Num;
+
+    u32 tilebase, mapbase;
+    if (!num)
+    {
+        tilebase = ((unit->DispCnt >> 24) & 0x7) << 16;
+        mapbase  = ((unit->DispCnt >> 27) & 0x7) << 16;
+    }
+    else
+    {
+        tilebase = 0;
+        mapbase  = 0;
+    }
+
+    int layertype[4] = {1, 1, 0, 0};
+    switch (unit->DispCnt & 0x7)
+    {
+        case 0: layertype[2] = 1; layertype[3] = 1; break;
+        case 1: layertype[2] = 1; layertype[3] = 2; break;
+        case 2: layertype[2] = 2; layertype[3] = 2; break;
+        case 3: layertype[2] = 1; layertype[3] = 3; break;
+        case 4: layertype[2] = 2; layertype[3] = 3; break;
+        case 5: layertype[2] = 3; layertype[3] = 3; break;
+        case 6: layertype[0] = 0; layertype[1] = 0;
+                layertype[2] = 4; layertype[3] = 0; break;
+        case 7: layertype[2] = 0; layertype[3] = 0; break;
+    }
+
+    for (int layer = 0; layer < 4; layer++)
+    {
+        int type = layertype[layer];
+        if (!type) continue;
+
+        u16 bgcnt = unit->BGCnt[layer];
+        auto& cfg = LayerConfig[num].uBGConfig[layer];
+
+        cfg.TileOffset = tilebase + (((bgcnt >> 2) & 0xF) << 14);
+        cfg.MapOffset  = mapbase  + (((bgcnt >> 8) & 0x1F) << 11);
+        cfg.PalOffset  = 0;
+
+        BGVRAMRange[num][layer][0] = cfg.TileOffset;
+        BGVRAMRange[num][layer][2] = cfg.MapOffset;
+
+        if ((layer == 0) && (unit->DispCnt & (1<<3)))
+        {
+            // 3D layer
+            cfg.Size[0] = 256; cfg.Size[1] = 192;
+            cfg.Type = 6;
+            cfg.Clamp = 1;
+            BGVRAMRange[num][layer][0] = 0xFFFFFFFF;
+            BGVRAMRange[num][layer][1] = 0xFFFFFFFF;
+            BGVRAMRange[num][layer][2] = 0xFFFFFFFF;
+            BGVRAMRange[num][layer][3] = 0xFFFFFFFF;
+        }
+        else if (type == 1)
+        {
+            // text layer
+            u32 tilesz = 0, mapsz = 0;
+            switch (bgcnt >> 14)
+            {
+                case 0: cfg.Size[0] = 256; cfg.Size[1] = 256; mapsz = 0x800;  break;
+                case 1: cfg.Size[0] = 512; cfg.Size[1] = 256; mapsz = 0x1000; break;
+                case 2: cfg.Size[0] = 256; cfg.Size[1] = 512; mapsz = 0x1000; break;
+                case 3: cfg.Size[0] = 512; cfg.Size[1] = 512; mapsz = 0x2000; break;
+            }
+
+            if (bgcnt & (1<<7))
+            {
+                // 256-color
+                cfg.Type = 1;
+                if (unit->DispCnt & (1<<30))
+                {
+                    int paloff = layer;
+                    if ((layer < 2) && (bgcnt & (1<<13))) paloff += 2;
+                    cfg.PalOffset = 1 + (16 * paloff);
+                }
+                tilesz = 0x10000;
+            }
+            else
+            {
+                // 16-color
+                cfg.Type = 0;
+                tilesz = 0x8000;
+            }
+            cfg.Clamp = 0;
+
+            int n = BGBaseIndex[0][bgcnt >> 14] + layer;
+            BGLayerTex[num][layer] = AllBGLayerTex[num][n];
+            BGLayerFB[num][layer]  = AllBGLayerFB[num][n];
+
+            BGVRAMRange[num][layer][1] = tilesz;
+            BGVRAMRange[num][layer][3] = mapsz;
+        }
+        else if (type == 2)
+        {
+            // affine layer
+            u32 mapsz = 0;
+            switch (bgcnt >> 14)
+            {
+                case 0: cfg.Size[0] = 128;  cfg.Size[1] = 128;  mapsz = 0x100;  break;
+                case 1: cfg.Size[0] = 256;  cfg.Size[1] = 256;  mapsz = 0x400;  break;
+                case 2: cfg.Size[0] = 512;  cfg.Size[1] = 512;  mapsz = 0x1000; break;
+                case 3: cfg.Size[0] = 1024; cfg.Size[1] = 1024; mapsz = 0x4000; break;
+            }
+            cfg.Type = 2;
+            cfg.Clamp = !(bgcnt & (1<<13));
+
+            int n = BGBaseIndex[1][bgcnt >> 14] + layer - 2;
+            BGLayerTex[num][layer] = AllBGLayerTex[num][n];
+            BGLayerFB[num][layer]  = AllBGLayerFB[num][n];
+
+            BGVRAMRange[num][layer][1] = 0x4000;
+            BGVRAMRange[num][layer][3] = mapsz;
+        }
+        else if (type == 3)
+        {
+            // extended layer
+            if (bgcnt & (1<<7))
+            {
+                // bitmap modes
+                u32 mapsz = 0;
+                switch (bgcnt >> 14)
+                {
+                    case 0: cfg.Size[0] = 128; cfg.Size[1] = 128; mapsz = 0x4000;  break;
+                    case 1: cfg.Size[0] = 256; cfg.Size[1] = 256; mapsz = 0x10000; break;
+                    case 2: cfg.Size[0] = 512; cfg.Size[1] = 256; mapsz = 0x20000; break;
+                    case 3: cfg.Size[0] = 512; cfg.Size[1] = 512; mapsz = 0x40000; break;
+                }
+
+                u32 tileoffset = 0;
+                u32 mapoffset = ((bgcnt >> 8) & 0x1F) << 14;
+
+                BGVRAMRange[num][layer][0] = 0xFFFFFFFF;
+                BGVRAMRange[num][layer][1] = 0xFFFFFFFF;
+                BGVRAMRange[num][layer][2] = mapoffset;
+                BGVRAMRange[num][layer][3] = mapsz;
+
+                if (bgcnt & (1<<2))
+                {
+                    // direct colour: 2 bytes/pixel. Display-capture detection
+                    // (Type 7/8) deferred to C4 — treat as plain direct bitmap.
+                    mapsz <<= 1;
+                    BGVRAMRange[num][layer][3] = mapsz;
+                    cfg.Type = 5;
+                }
+                else
+                    cfg.Type = 4;
+
+                cfg.TileOffset = tileoffset;
+                cfg.MapOffset  = mapoffset;
+
+                int n = BGBaseIndex[2][bgcnt >> 14] + layer - 2;
+                BGLayerTex[num][layer] = AllBGLayerTex[num][n];
+                BGLayerFB[num][layer]  = AllBGLayerFB[num][n];
+            }
+            else
+            {
+                // rotscale w/ tiles (always 256-color)
+                u32 mapsz = 0;
+                switch (bgcnt >> 14)
+                {
+                    case 0: cfg.Size[0] = 128;  cfg.Size[1] = 128;  mapsz = 0x200;  break;
+                    case 1: cfg.Size[0] = 256;  cfg.Size[1] = 256;  mapsz = 0x800;  break;
+                    case 2: cfg.Size[0] = 512;  cfg.Size[1] = 512;  mapsz = 0x2000; break;
+                    case 3: cfg.Size[0] = 1024; cfg.Size[1] = 1024; mapsz = 0x8000; break;
+                }
+
+                cfg.Type = 3;
+                if (unit->DispCnt & (1<<30))
+                {
+                    int paloff = layer;
+                    if ((layer < 2) && (bgcnt & (1<<13))) paloff += 2;
+                    cfg.PalOffset = 1 + (16 * paloff);
+                }
+
+                int n = BGBaseIndex[1][bgcnt >> 14] + layer - 2;
+                BGLayerTex[num][layer] = AllBGLayerTex[num][n];
+                BGLayerFB[num][layer]  = AllBGLayerFB[num][n];
+
+                BGVRAMRange[num][layer][1] = 0x10000;
+                BGVRAMRange[num][layer][3] = mapsz;
+            }
+
+            cfg.Clamp = !(bgcnt & (1<<13));
+        }
+        else // type == 4 — large bitmap layer
+        {
+            u32 mapsz = 0;
+            switch (bgcnt >> 14)
+            {
+                case 0: cfg.Size[0] = 512;  cfg.Size[1] = 1024; mapsz = 0x80000; break;
+                case 1: cfg.Size[0] = 1024; cfg.Size[1] = 512;  mapsz = 0x80000; break;
+                case 2: cfg.Size[0] = 512;  cfg.Size[1] = 256;  mapsz = 0x20000; break;
+                case 3: cfg.Size[0] = 512;  cfg.Size[1] = 512;  mapsz = 0x40000; break;
+            }
+
+            cfg.Type = 4;
+            cfg.TileOffset = 0;
+            cfg.MapOffset  = 0;
+            cfg.Clamp = !(bgcnt & (1<<13));
+
+            int n = BGBaseIndex[3][bgcnt >> 14];
+            BGLayerTex[num][layer] = AllBGLayerTex[num][n];
+            BGLayerFB[num][layer]  = AllBGLayerFB[num][n];
+
+            BGVRAMRange[num][layer][0] = 0xFFFFFFFF;
+            BGVRAMRange[num][layer][1] = 0xFFFFFFFF;
+            BGVRAMRange[num][layer][3] = mapsz;
+        }
+    }
+
+    glBindBuffer(GL_UNIFORM_BUFFER, LayerConfigUBO[num]);
+    glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(sLayerConfig), &LayerConfig[num]);
+}
+
 // ── Rendering: software passthrough until the GPU pipeline closes (C4) ─────
 
 void GLRenderer2D::SetFramebuffer(u32* unitA, u32* unitB)

@@ -63,6 +63,12 @@ private:
     // the software passthrough (C4); not wired during passthrough.
     void UpdateScanlineConfig(int line, Unit* unit);
 
+    // Derive per-BG layer config (size/type/offsets/palette) + VRAM ranges from
+    // the control registers; selects the AllBGLayer texture/FB per layer and
+    // uploads LayerConfig[unit->Num] to its UBO. Display-capture BG types 7/8
+    // are deferred (treated as direct-colour bitmap, Type 5) until C4.
+    void UpdateLayerConfig(Unit* unit);
+
     bool GLReady = false;
 
     // LayerPre program (shared between units). The fork's
@@ -114,6 +120,12 @@ private:
     // pre-rendered BG layer textures: all possible sizes (22), per unit.
     GLuint AllBGLayerTex[2][22] = {};
     GLuint AllBGLayerFB[2][22]  = {};
+
+    // the AllBGLayer texture/FB selected for each of the 4 active BG layers,
+    // and the VRAM tile/map ranges each layer reads (for upload in C2.3).
+    GLuint BGLayerTex[2][4] = {};
+    GLuint BGLayerFB[2][4]  = {};
+    u32    BGVRAMRange[2][4][4] = {};
 
     // C1/C2 passthrough backend (correctness fallback until C4 closes the loop).
     SoftRenderer Soft;
