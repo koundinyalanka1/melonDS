@@ -16,22 +16,29 @@
     with melonDS. If not, see http://www.gnu.org/licenses/.
 */
 
-#ifndef ARMJIT_COMPILER_H
-#define ARMJIT_COMPILER_H
+.syntax unified
+.text
+.arm
 
-#if defined(__x86_64__)
-#include "ARMJIT_x64/ARMJIT_Compiler.h"
-#elif defined(__aarch64__)
-#include "ARMJIT_A64/ARMJIT_Compiler.h"
-#elif defined(__arm__)
-#include "ARMJIT_A32/ARMJIT_Compiler.h"
-#else
-#error "The current target platform doesn't have a JIT backend"
-#endif
+.p2align 4,,15
+.global ARM_Dispatch
+.type ARM_Dispatch, %function
+ARM_Dispatch:
+    push {r4-r11, r12, lr}
+    mov r4, r0
+    bx r1
 
-namespace ARMJIT
-{
-extern Compiler* JITCompiler;
-}
+.p2align 4,,15
+.global ARM_Ret
+.type ARM_Ret, %function
+ARM_Ret:
+    pop {r4-r11, r12, lr}
+    bx lr
 
-#endif
+.p2align 4,,15
+.global ARM_RestoreContext
+.type ARM_RestoreContext, %function
+ARM_RestoreContext:
+    mov sp, r0
+    pop {r0-r12, lr}
+    pop {pc}

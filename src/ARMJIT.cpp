@@ -44,10 +44,12 @@
 #include "NDSCart.h"
 
 
+#if !defined(__arm__)
 #include "ARMJIT_x64/ARMJIT_Offsets.h"
 static_assert(offsetof(ARM, CPSR) == ARM_CPSR_offset, "");
 static_assert(offsetof(ARM, Cycles) == ARM_Cycles_offset, "");
 static_assert(offsetof(ARM, StopExecution) == ARM_StopExecution_offset, "");
+#endif
 
 namespace ARMJIT
 {

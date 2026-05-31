@@ -8,7 +8,9 @@ HAVE_THREADS := 1
 # YAGE: OpenGL renderer enabled for the Android/GLES3 build.
 HAVE_OPENGL := 1
 
-ifeq ($(TARGET_ARCH_ABI),arm64-v8a)
+ifeq ($(TARGET_ARCH_ABI),armeabi-v7a)
+  JIT_ARCH := armv7
+else ifeq ($(TARGET_ARCH_ABI),arm64-v8a)
   JIT_ARCH := aarch64
 else ifeq ($(TARGET_ARCH_ABI),x86_64)
   JIT_ARCH := x64
@@ -44,8 +46,9 @@ LOCAL_LDFLAGS  += -flto=thin
 # ── YAGE: fleet-safe 32-bit tuning for A53/A55-class Android-TV SoCs ───────
 # Use -mtune (NOT -mcpu): it schedules for the dominant in-order Cortex-A53/A55
 # WITHOUT raising the ISA above the armv7-a baseline, so the binary still runs
-# on genuine pre-ARMv8 (A7/A9) 32-bit devices. melonDS has no AArch32 JIT, so
-# these 32-bit builds are pure interpreter and benefit from the scheduling tune.
+# on genuine pre-ARMv8 (A7/A9) 32-bit devices. The first AArch32 JIT backend
+# is helper-call based, so these builds still benefit from interpreter-oriented
+# scheduling until native opcode coverage lands.
 ifeq ($(TARGET_ARCH_ABI),armeabi-v7a)
   LOCAL_CFLAGS   += -march=armv7-a -mtune=cortex-a53 -mfpu=neon
   LOCAL_CPPFLAGS += -march=armv7-a -mtune=cortex-a53 -mfpu=neon

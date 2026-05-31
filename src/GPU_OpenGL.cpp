@@ -17,13 +17,23 @@
 */
 
 #include "GPU_OpenGL.h"
+#ifndef YAGE_MELONDS_GL_DIAG
+#define YAGE_MELONDS_GL_DIAG 0
+#endif
+
 #ifdef __ANDROID__
 #include <android/log.h>
-#define MELONDS_COMP_LOG(...) __android_log_print(ANDROID_LOG_ERROR, "melonDS-GLES", __VA_ARGS__)
+#define MELONDS_COMP_LOGI(...) __android_log_print(ANDROID_LOG_INFO, "melonDS-GLES", __VA_ARGS__)
+#define MELONDS_COMP_LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "melonDS-GLES", __VA_ARGS__)
 #else
-#define MELONDS_COMP_LOG(...) ((void)0)
+#define MELONDS_COMP_LOGI(...) ((void)0)
+#define MELONDS_COMP_LOGE(...) ((void)0)
 #endif
-#define CHECK_COMP_FBO(idx) { GLenum s = glCheckFramebufferStatus(GL_FRAMEBUFFER); if (s != 0x8CD5) MELONDS_COMP_LOG("Compositor FBO Out[%d] INCOMPLETE: 0x%04x", (idx), s); else MELONDS_COMP_LOG("Compositor FBO Out[%d] complete (0x%04x)", (idx), s); }
+#if YAGE_MELONDS_GL_DIAG
+#define CHECK_COMP_FBO(idx) { GLenum s = glCheckFramebufferStatus(GL_FRAMEBUFFER); if (s != GL_FRAMEBUFFER_COMPLETE) MELONDS_COMP_LOGE("Compositor FBO Out[%d] INCOMPLETE: 0x%04x", (idx), s); else MELONDS_COMP_LOGI("Compositor FBO Out[%d] complete (0x%04x)", (idx), s); }
+#else
+#define CHECK_COMP_FBO(idx) { GLenum s = glCheckFramebufferStatus(GL_FRAMEBUFFER); if (s != GL_FRAMEBUFFER_COMPLETE) MELONDS_COMP_LOGE("Compositor FBO Out[%d] INCOMPLETE: 0x%04x", (idx), s); }
+#endif
 
 #include <cstdio>
 #include <cstring>

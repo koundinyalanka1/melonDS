@@ -366,9 +366,75 @@ void setup_opengl_frame_state(void)
    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(screen_vertices), screen_vertices);
 }
 
+static void remap_gl2d_triangle(float* dst, int tri, bool bottom)
+{
+   for (int j = 0; j < 3; j++)
+   {
+      int idx = tri + j;
+      float ty = screen_vertices[(4 * idx) + 3];
+
+      dst[(4 * idx) + 0] = screen_vertices[(4 * idx) + 0];
+      dst[(4 * idx) + 1] = screen_vertices[(4 * idx) + 1];
+      dst[(4 * idx) + 2] = screen_vertices[(4 * idx) + 2];
+      dst[(4 * idx) + 3] = bottom ? ((ty - 0.5f) * 2.0f) : (ty * 2.0f);
+   }
+}
+
+static bool render_gl2d_output(void)
+{
+   float gl2d_vertices[72] = {};
+   int vertex_count = screen_layout_data.hybrid_small_screen == SmallScreenLayout::SmallScreenDuplicate ? 18 : 12;
+
+   for (int tri = 0; tri < vertex_count; tri += 3)
+   {
+      float ty = 0.0f;
+      for (int j = 0; j < 3; j++)
+         ty += screen_vertices[(4 * (tri + j)) + 3];
+
+      remap_gl2d_triangle(gl2d_vertices, tri, (ty / 3.0f) >= 0.5f);
+   }
+
+   glBindBuffer(GL_ARRAY_BUFFER, vbo);
+   glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(gl2d_vertices), gl2d_vertices);
+   glBindVertexArray(vao); CHECK_GL("glBindVertexArray(GL2D)");
+
+   GLint filter = opengl_linear_filtering ? GL_LINEAR : GL_NEAREST;
+   for (int tri = 0; tri < vertex_count; tri += 3)
+   {
+      float ty = 0.0f;
+      for (int j = 0; j < 3; j++)
+         ty += screen_vertices[(4 * (tri + j)) + 3];
+
+      bool bottom = (ty / 3.0f) >= 0.5f;
+      glActiveTexture(GL_TEXTURE0);
+      if (!GPU::Bind2DOutputTextureForScreen(bottom ? 1 : 0))
+         return false;
+
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+      glDrawArrays(GL_TRIANGLES, tri, 3); CHECK_GL("glDrawArrays(GL2D)");
+   }
+
+   return true;
+}
+
+static void prepare_gl2d_present_state(void)
+{
+   glDisable(GL_DEPTH_TEST);
+   glDisable(GL_STENCIL_TEST);
+   glDisable(GL_BLEND);
+   glDisable(GL_SCISSOR_TEST);
+   glDisable(GL_CULL_FACE);
+   glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+   glDepthMask(GL_TRUE);
+   glStencilMask(0xFF);
+}
+
 void render_opengl_frame(bool sw)
 {
-   glsm_ctl(GLSM_CTL_STATE_BIND, NULL);
+   bool gl2d_active = GPU::GL2DActive;
+   if (!gl2d_active)
+      glsm_ctl(GLSM_CTL_STATE_BIND, NULL);
 
    int frontbuf = GPU::FrontBuffer;
    bool virtual_cursor = cursor_enabled(&input_state);
@@ -405,7 +471,17 @@ void render_opengl_frame(bool sw)
 
    glActiveTexture(GL_TEXTURE0);
 
-   if (sw)
+   if (gl2d_active)
+   {
+      prepare_gl2d_present_state();
+      if (!render_gl2d_output())
+      {
+         if (!gl2d_active)
+            glsm_ctl(GLSM_CTL_STATE_UNBIND, NULL);
+         return;
+      }
+   }
+   else if (sw)
    {
       glBindTexture(GL_TEXTURE_2D, screen_framebuffer_texture);
 
@@ -422,17 +498,21 @@ void render_opengl_frame(bool sw)
       GPU::CurGLCompositor->BindOutputTexture(frontbuf); CHECK_GL("BindOutputTexture");
    }
 
-   GLint filter = opengl_linear_filtering ? GL_LINEAR : GL_NEAREST;
-   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
-   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+   if (!gl2d_active)
+   {
+      GLint filter = opengl_linear_filtering ? GL_LINEAR : GL_NEAREST;
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
 
-   glBindBuffer(GL_ARRAY_BUFFER, vbo);
-   glBindVertexArray(vao); CHECK_GL("glBindVertexArray");
-   glDrawArrays(GL_TRIANGLES, 0, screen_layout_data.hybrid_small_screen == SmallScreenLayout::SmallScreenDuplicate ? 18 : 12); CHECK_GL("glDrawArrays");
+      glBindBuffer(GL_ARRAY_BUFFER, vbo);
+      glBindVertexArray(vao); CHECK_GL("glBindVertexArray");
+      glDrawArrays(GL_TRIANGLES, 0, screen_layout_data.hybrid_small_screen == SmallScreenLayout::SmallScreenDuplicate ? 18 : 12); CHECK_GL("glDrawArrays");
+   }
 
    glFlush();
 
-   glsm_ctl(GLSM_CTL_STATE_UNBIND, NULL);
+   if (!gl2d_active)
+      glsm_ctl(GLSM_CTL_STATE_UNBIND, NULL);
 
    video_cb(RETRO_HW_FRAME_BUFFER_VALID, screen_layout_data.buffer_width, screen_layout_data.buffer_height, 0);
 }

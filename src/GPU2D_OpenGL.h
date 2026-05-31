@@ -49,6 +49,9 @@ public:
     void DrawSprites(u32 line, Unit* unit) override;
     void VBlankEnd(Unit* unitA, Unit* unitB) override;
 
+    void BindOutputTexture(int unit);
+    void BindOutputTextureForScreen(int screen);
+
 private:
     // ── GL setup (C2.1) ───────────────────────────────────────────────────
     bool InitShaders();
@@ -120,12 +123,9 @@ private:
     // ── Frame driver (C4.2) ───────────────────────────────────────────────
     // Run the whole GPU 2D pipeline for `unit` for the frame whose per-scanline
     // config has been captured (BG prerender → sprite prerender + composite →
-    // screen composite → OutputTex), then read OutputTex back into the unit's
-    // CPU backbuffer so the existing (software) libretro display path presents
-    // it. Called from DrawScanline at the last visible scanline.
-    //
-    // v1 note: the GPU→CPU readback is a correctness-first stand-in for the real
-    // display path (bind OutputTex directly, no readback) — see §15.8/C5.
+    // screen composite → OutputTex). Called from DrawScanline at the last
+    // visible scanline. The libretro GL present path samples OutputTex directly;
+    // there is no GPU→CPU readback in the hot path.
     void RenderFrame(Unit* unit);
 
     bool GLReady = false;
@@ -198,7 +198,7 @@ private:
         u32 BackColor;
         u32 WinRegs;
         u32 WinMask;
-        u32 __pad0[1];
+        u32 MasterBright;       // reg 0x6C, applied to the final composited pixel
         s32 WinPos[4];
         u32 BGMosaicEnable[4];
         s32 MosaicSize[4];
@@ -300,6 +300,7 @@ private:
     GLuint CompositorConfigUBO[2] = {0, 0};
     GLuint OutputTex[2] = {0, 0};   // final composited screen (RGBA8, scaled)
     GLuint OutputFB[2]  = {0, 0};
+    int    OutputScreenUnit[2] = {1, 0};
     // first scanline not yet composited this frame (per unit).
     int    LastLine[2]  = {0, 0};
 
@@ -307,6 +308,20 @@ private:
     // by the driver at C4.2 (= GPU3D_OpenGL FramebufferTex[GPU::FrontBuffer]);
     // 0 until then. RenderScreen binds it to BGLayerTex[0] when DispCnt&(1<<3).
     GLuint Output3DTex = 0;
+
+    // ── Palette upload caching (frame-to-frame change detection) ──────────
+    // Palettes are often static between frames (e.g. during scroll-only
+    // animations). The GPU upload (swizzle loop + glTexSubImage2D) is skipped
+    // when the source palette data hasn't changed since the last upload.
+    // bionic's memcmp is NEON-vectorised so the check is cheap (~7 µs per
+    // buffer) vs the upload (~350 µs per unit). The previous-frame buffers
+    // are always invalidated on Init to force the first frame to upload.
+    static constexpr int kBGPalEntries  = 256 * (1 + 4 * 16); // std + 4×16 ext-pal rows
+    static constexpr int kOBJPalEntries = 256 * (1 + 16);     // std + 16 ext-pal rows
+    u16 PrevPalBG[2][kBGPalEntries]   = {};
+    u16 PrevPalOBJ[2][kOBJPalEntries] = {};
+    bool PalBGValid[2]  = {false, false};
+    bool PalOBJValid[2] = {false, false};
 
     // C1/C2 passthrough backend (correctness fallback until C4 closes the loop).
     SoftRenderer Soft;

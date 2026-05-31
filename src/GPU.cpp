@@ -24,6 +24,7 @@
 #include "GPU2D_Soft.h"
 #ifdef OGLRENDERER_ENABLED
 #include "GPU2D_OpenGL.h"
+#include "GPU3D_OpenGL.h"
 #endif
 
 namespace GPU
@@ -93,6 +94,50 @@ std::unique_ptr<GPU2D::Renderer2D> GPU2D_Renderer = {};
 // Set from the `melonds_2d_renderer` core option; consulted by InitRenderer().
 bool Enable2DOpenGL = false;
 bool GL2DActive = false;
+bool SkipFrameRendering = false;
+
+bool Bind2DOutputTextureForScreen(int screen)
+{
+#ifdef OGLRENDERER_ENABLED
+    if (!GL2DActive)
+        return false;
+
+    auto* gl2d = static_cast<GPU2D::GLRenderer2D*>(GPU2D_Renderer.get());
+
+    gl2d->BindOutputTextureForScreen(screen);
+    return true;
+#else
+    (void)screen;
+    return false;
+#endif
+}
+
+u32 Get3DOutputTexture()
+{
+#ifdef OGLRENDERER_ENABLED
+    if (!GPU3D::CurrentRenderer || !GPU3D::CurrentRenderer->Accelerated)
+        return 0;
+
+    auto* gl3d = reinterpret_cast<GPU3D::GLRenderer*>(GPU3D::CurrentRenderer.get());
+    return gl3d->GetAccelFrameTexture();
+#else
+    return 0;
+#endif
+}
+
+bool Bind3DOutputTexture()
+{
+#ifdef OGLRENDERER_ENABLED
+    if (!GPU3D::CurrentRenderer || !GPU3D::CurrentRenderer->Accelerated)
+        return false;
+
+    auto* gl3d = reinterpret_cast<GPU3D::GLRenderer*>(GPU3D::CurrentRenderer.get());
+    gl3d->SetupAccelFrame();
+    return true;
+#else
+    return false;
+#endif
+}
 
 /*
     VRAM invalidation tracking
@@ -1054,14 +1099,14 @@ void StartHBlank(u32 line)
     {
         // draw
         // note: this should start 48 cycles after the scanline start
-        if (line < 192)
+        if (line < 192 && !SkipFrameRendering)
         {
             GPU2D_Renderer->DrawScanline(line, &GPU2D_A);
             GPU2D_Renderer->DrawScanline(line, &GPU2D_B);
         }
 
         // sprites are pre-rendered one scanline in advance
-        if (line < 191)
+        if (line < 191 && !SkipFrameRendering)
         {
             GPU2D_Renderer->DrawSprites(line+1, &GPU2D_A);
             GPU2D_Renderer->DrawSprites(line+1, &GPU2D_B);
@@ -1071,12 +1116,16 @@ void StartHBlank(u32 line)
     }
     else if (VCount == 215)
     {
-        GPU3D::VCount215();
+        if (!SkipFrameRendering)
+            GPU3D::VCount215();
     }
     else if (VCount == 262)
     {
-        GPU2D_Renderer->DrawSprites(0, &GPU2D_A);
-        GPU2D_Renderer->DrawSprites(0, &GPU2D_B);
+        if (!SkipFrameRendering)
+        {
+            GPU2D_Renderer->DrawSprites(0, &GPU2D_A);
+            GPU2D_Renderer->DrawSprites(0, &GPU2D_B);
+        }
     }
 
     if (DispStat[0] & (1<<4)) NDS::SetIRQ(0, NDS::IRQ_HBlank);
@@ -1172,7 +1221,8 @@ void StartScanline(u32 line)
             // texture memory anyway and only update it before the start
             //of the next frame.
             // So we can give the rasteriser a bit more headroom
-            GPU3D::VCount144();
+            if (!SkipFrameRendering)
+                GPU3D::VCount144();
 
             // VBlank
             DispStat[0] |= (1<<0);
@@ -1192,7 +1242,7 @@ void StartScanline(u32 line)
 
 #ifdef OGLRENDERER_ENABLED
             // Need a better way to identify the openGL renderer in particular
-            if (GPU3D::CurrentRenderer->Accelerated)
+            if (!SkipFrameRendering && GPU3D::CurrentRenderer->Accelerated)
                 CurGLCompositor->RenderFrame();
 #endif
         }
@@ -1379,8 +1429,8 @@ T ReadVRAM_AOBJExtPal(u32 addr)
     u32 mask = VRAMMap_AOBJExtPal;
 
     T ret = 0;
-    if (mask & (1<<4)) ret |= *(T*)&VRAM_F[addr & 0x1FFF];
-    if (mask & (1<<5)) ret |= *(T*)&VRAM_G[addr & 0x1FFF];
+    if (mask & (1<<5)) ret |= *(T*)&VRAM_F[addr & 0x1FFF];
+    if (mask & (1<<6)) ret |= *(T*)&VRAM_G[addr & 0x1FFF];
 
     return ret;
 }

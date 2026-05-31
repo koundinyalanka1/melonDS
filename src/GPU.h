@@ -188,6 +188,14 @@ extern bool Enable2DOpenGL;
 // any fallback to the SoftRenderer. (C4.2)
 extern bool GL2DActive;
 
+// Frontend-controlled frameskip: when true, emulation still advances normally
+// but expensive 2D/3D render passes are skipped so the previous presented frame
+// can be reused on CPU/GPU-bound hosts.
+extern bool SkipFrameRendering;
+bool Bind2DOutputTextureForScreen(int screen);
+bool Bind3DOutputTexture();
+u32 Get3DOutputTexture();
+
 void InitRenderer(int renderer);
 void DeInitRenderer();
 void ResetRenderer();

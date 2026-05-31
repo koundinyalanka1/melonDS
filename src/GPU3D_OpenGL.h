@@ -41,6 +41,8 @@ public:
     virtual u32* GetLine(int line) override;
 
     void SetupAccelFrame();
+    GLuint GetAccelFrameTexture() const;
+    GLuint GetFramebufferTex(int idx) const { return FramebufferTex[idx & 1]; }
     void PrepareCaptureFrame();
 private:
 

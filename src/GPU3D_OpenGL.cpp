@@ -25,13 +25,23 @@
 */
 
 #include "GPU3D_OpenGL.h"
+#ifndef YAGE_MELONDS_GL_DIAG
+#define YAGE_MELONDS_GL_DIAG 0
+#endif
+
 #ifdef __ANDROID__
 #include <android/log.h>
-#define MELONDS_3D_LOG(...) __android_log_print(ANDROID_LOG_ERROR, "melonDS-GLES", __VA_ARGS__)
+#define MELONDS_3D_LOGI(...) __android_log_print(ANDROID_LOG_INFO, "melonDS-GLES", __VA_ARGS__)
+#define MELONDS_3D_LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "melonDS-GLES", __VA_ARGS__)
 #else
-#define MELONDS_3D_LOG(...) ((void)0)
+#define MELONDS_3D_LOGI(...) ((void)0)
+#define MELONDS_3D_LOGE(...) ((void)0)
 #endif
-#define CHECK_MRT_FBO(label) { GLenum s = glCheckFramebufferStatus(GL_FRAMEBUFFER); if (s != 0x8CD5) MELONDS_3D_LOG("MRT FBO " label " INCOMPLETE: 0x%04x", s); else MELONDS_3D_LOG("MRT FBO " label " complete (0x%04x)", s); }
+#if YAGE_MELONDS_GL_DIAG
+#define CHECK_MRT_FBO(label) { GLenum s = glCheckFramebufferStatus(GL_FRAMEBUFFER); if (s != GL_FRAMEBUFFER_COMPLETE) MELONDS_3D_LOGE("MRT FBO " label " INCOMPLETE: 0x%04x", s); else MELONDS_3D_LOGI("MRT FBO " label " complete (0x%04x)", s); }
+#else
+#define CHECK_MRT_FBO(label) { GLenum s = glCheckFramebufferStatus(GL_FRAMEBUFFER); if (s != GL_FRAMEBUFFER_COMPLETE) MELONDS_3D_LOGE("MRT FBO " label " INCOMPLETE: 0x%04x", s); }
+#endif
 
 #include <stdio.h>
 #include <string.h>
@@ -327,6 +337,7 @@ void GLRenderer::DeInit()
 
 void GLRenderer::Reset()
 {
+    FrontBuffer = 0;
 }
 
 void GLRenderer::SetRenderSettings(GPU::RenderSettings& settings)
@@ -372,6 +383,18 @@ void GLRenderer::SetRenderSettings(GPU::RenderSettings& settings)
     glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, FramebufferTex[7], 0);
     glDrawBuffers(2, fbassign);
     CHECK_MRT_FBO("FBO[1]");
+
+    // Clear both 3D colour output textures to transparent black. glTexImage2D
+    // with NULL leaves content undefined on GLES3; the GL 2D compositor samples
+    // FramebufferTex[FrontBuffer^1] on the very first rendered frame (before
+    // GPU3D has drawn anything), so it must see black rather than garbage.
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClearDepthf(1.0f);
+    for (int i = 0; i <= 1; i++)
+    {
+        glBindFramebuffer(GL_FRAMEBUFFER, FramebufferID[i]);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    }
 
     glBindFramebuffer(GL_FRAMEBUFFER, FramebufferID[0]);
 
@@ -1344,7 +1367,15 @@ u32* GLRenderer::GetLine(int line)
 
 void GLRenderer::SetupAccelFrame()
 {
-    glBindTexture(GL_TEXTURE_2D, FramebufferTex[FrontBuffer]);
+    glBindTexture(GL_TEXTURE_2D, GetAccelFrameTexture());
+}
+
+GLuint GLRenderer::GetAccelFrameTexture() const
+{
+    // RenderFrame() draws into FrontBuffer, then flips it for the next draw.
+    // The completed 3D image, used by the 2D compositor as BG0, is therefore
+    // the opposite buffer. PrepareCaptureFrame() uses the same convention.
+    return FramebufferTex[FrontBuffer ^ 1];
 }
 
 }

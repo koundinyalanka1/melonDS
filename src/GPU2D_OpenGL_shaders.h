@@ -627,6 +627,7 @@ struct sScanline
     int BackColor;
     uint WinRegs;
     int WinMask;
+    int MasterBright;
     ivec4 WinPos;
     bvec4 BGMosaicEnable;
     ivec4 MosaicSize;
@@ -664,7 +665,11 @@ ivec3 ConvertColor(int col)
     return ret;
 }
 
-vec4 BG0Fetch(vec2 coord) { return texture(BGLayerTex[0], coord); }
+vec4 BG0Fetch(vec2 coord)
+{
+    vec4 col = texture(BGLayerTex[0], coord);
+    return uEnable3D ? col.bgra : col;
+}
 vec4 BG1Fetch(vec2 coord) { return texture(BGLayerTex[1], coord); }
 vec4 BG2Fetch(vec2 coord) { return texture(BGLayerTex[2], coord); }
 vec4 BG3Fetch(vec2 coord) { return texture(BGLayerTex[3], coord); }
@@ -673,6 +678,26 @@ vec4 BG0CalcAndFetch(vec2 coord, int line)
 {
     ivec2 bgoffset = uScanline[line].BGOffset[0];
     vec2 bgpos = vec2(bgoffset.xy) + coord;
+
+    if (uEnable3D)
+    {
+        ivec2 texsize = uBGConfig[0].Size * uScaleFactor;
+        // GPU3D vertex shader maps NDS screen y=0 (top) → NDC y=-1 → texture y=0.
+        // So texture y == NDS scanline index directly. bgpos.y = fract(fTexcoord.y) ≈ 0
+        // for every scanline — using it would always sample row 0, hiding the castle.
+        ivec2 texcoord = ivec2(
+            int(floor(bgpos.x * float(uScaleFactor))),
+            line * uScaleFactor
+        );
+        texcoord = clamp(texcoord, ivec2(0), texsize - ivec2(1));
+
+        vec4 col = texelFetch(BGLayerTex[0], texcoord, 0);
+        // GPU3D writes BGR into its RGBA target (FinalColor() returns col.bgra),
+        // matching the old GL compositor path in GPU_OpenGL_shaders.h. Convert it
+        // back to RGB here so BG0 enters the GL2D compositor in the same order as
+        // BG1-3 and OBJ before CompositeLayers() does the final screen swizzle.
+        return col.bgra;
+    }
 
     if (uScanline[line].BGMosaicEnable[0])
         bgpos = floor(bgpos) - vec2(MosaicX, 0);
@@ -951,6 +976,19 @@ vec4 CompositeLayers()
         // 3D layer blending
         col1 = ((col1 * eva) + (col2 * evb) + 0x10) >> 5;
     }
+
+    // Master brightness (reg 0x6C) — final whole-screen fade, applied after all
+    // BG/OBJ/blend compositing. Mirrors SoftRenderer::ColorBrightnessUp/Down:
+    // up   = c + (((0x3F - c) * f) >> 4),  down = c - ((c * f) >> 4),  f clamped 16.
+    // (No +0x8/+0x7 rounding — that is the BLDY effect above, not master bright.)
+    int mbMode   = (uScanline[line].MasterBright >> 14) & 0x3;
+    int mbFactor = uScanline[line].MasterBright & 0x1F;
+    if (mbFactor > 16) mbFactor = 16;
+    if (mbMode == 1)
+        col1.rgb = col1.rgb + (((ivec3(0x3F) - col1.rgb) * mbFactor) >> 4);
+    else if (mbMode == 2)
+        col1.rgb = col1.rgb - ((col1.rgb * mbFactor) >> 4);
+    col1.rgb = clamp(col1.rgb, ivec3(0), ivec3(0x3F));
 
     // Swizzle RGB→BGR so the RGBA bytes in Framebuffer[] match the BGRA layout
     // the libretro screen shader expects (it does .bgr to correct SoftRenderer's

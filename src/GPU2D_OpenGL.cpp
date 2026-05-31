@@ -15,9 +15,14 @@
 #include "GPU2D_OpenGL_shaders.h"
 #include "GPU.h"
 #include "GPU3D.h"
+#include "GPU3D_OpenGL.h"
 
 #include <cstring>   // memcpy / memset
 #include <cstddef>   // offsetof
+
+#ifndef YAGE_MELONDS_GL_DIAG
+#define YAGE_MELONDS_GL_DIAG 0
+#endif
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -39,6 +44,7 @@ namespace GPU2D
 // (which, unlike the 3D ones, were never status-checked on the real driver).
 // Logged at INFO via MELONDS_2D_LOG so it is platform-agnostic. Remove once the
 // pipeline is validated.
+#if YAGE_MELONDS_GL_DIAG
 #define GL2D_CHK(tag) do { GLenum e_; while ((e_ = glGetError()) != GL_NO_ERROR) \
     MELONDS_2D_LOG("2D-GL 0x%04x @ %s", e_, (tag)); } while (0)
 static inline void GL2D_FBO(const char* tag)
@@ -47,6 +53,10 @@ static inline void GL2D_FBO(const char* tag)
     if (s != GL_FRAMEBUFFER_COMPLETE)
         MELONDS_2D_LOG("2D-FBO %s INCOMPLETE 0x%04x", tag, s);
 }
+#else
+#define GL2D_CHK(tag) do { (void)sizeof(tag); } while (0)
+static inline void GL2D_FBO(const char*) {}
+#endif
 
 // Equivalent of upstream OpenGLSupport's glDefaultTexParams (absent in this
 // fork): nearest filtering, clamp-to-edge — what the DS 2D textures want.
@@ -82,9 +92,9 @@ bool GLRenderer2D::Init()
         return false;
     }
     GLReady = true;
-    MELONDS_2D_LOG("GPU2D: GL 2D renderer ACTIVE (C4.2: BG + OBJ + compositor "
-                   "drive frames; v1 reads OutputTex back to the CPU framebuffer "
-                   "for display; 3D-layer hook + upscaling pending)");
+    MELONDS_2D_LOG("GPU2D: GL 2D renderer ACTIVE (C5: BG + OBJ + compositor "
+                   "drive frames; OutputTex is presented directly; "
+                   "3D-layer hook active; upscaling pending)");
     return true;
 }
 
@@ -239,6 +249,10 @@ bool GLRenderer2D::InitResources()
         glGenBuffers(1, &LayerConfigUBO[u]);
         glBindBuffer(GL_UNIFORM_BUFFER, LayerConfigUBO[u]);
         glBufferData(GL_UNIFORM_BUFFER, sizeof(sLayerConfig), nullptr, GL_STREAM_DRAW);
+
+        // BG VRAM mask in texture rows (bgheight-1), for the shader's
+        // (addr >> 10) & uVRAMMask wraparound — mirrors SpriteConfig.uVRAMMask.
+        LayerConfig[u].uVRAMMask = (u32)(bgheight - 1);
 
         glGenBuffers(1, &ScanlineConfigUBO[u]);
         glBindBuffer(GL_UNIFORM_BUFFER, ScanlineConfigUBO[u]);
@@ -621,8 +635,29 @@ void GLRenderer2D::UpdateScanlineConfig(int line, Unit* unit)
     }
     cfg.BGMosaicEnable[3] = (unit->BGCnt[3] & (1<<6)) ? xmosaic : false;
 
+    // The software renderer advances affine/extended BG reference points after
+    // drawing each scanline. GL captures all scanlines up front, so it must do
+    // the same bookkeeping here or mode-5 BG2/BG3 sample the same reference row
+    // for the whole frame, dropping scenery such as NSMB's castle/ground.
+    if ((unit->DispCnt & 0x0400) && ((bgmode == 2) || (bgmode >= 4 && bgmode <= 6)))
+    {
+        unit->BGXRefInternal[0] += unit->BGRotB[0];
+        unit->BGYRefInternal[0] += unit->BGRotD[0];
+    }
+    if ((unit->DispCnt & 0x0800) && (bgmode >= 1 && bgmode <= 5))
+    {
+        unit->BGXRefInternal[1] += unit->BGRotB[1];
+        unit->BGYRefInternal[1] += unit->BGRotD[1];
+    }
+
     u16* pal = (u16*)&GPU::Palette[unit->Num ? 0x400 : 0];
     cfg.BackColor = pal[0];
+
+    // Master brightness (reg 0x6C): final whole-screen brightness fade, applied
+    // per-scanline in the compositor FS. Matches SoftRenderer's ColorBrightness
+    // Up/Down (no rounding, factor clamped to 16). Used by virtually every game's
+    // scene fade-in/out transitions.
+    cfg.MasterBright = unit->MasterBrightness;
 
     // mosaic sizes
     cfg.MosaicSize[0] = unit->BGMosaicSize[0];
@@ -964,6 +999,19 @@ void GLRenderer2D::UploadBGVRAM(Unit* unit)
 {
     const int num = unit->Num;
 
+    // Sync the lazy-coherency flat VRAM buffers from the underlying bank data.
+    // The soft renderer does this per DrawScanline; we must do it per frame here.
+    if (num == 0)
+    {
+        auto bgDirty = GPU::VRAMDirty_ABG.DeriveState(GPU::VRAMMap_ABG);
+        GPU::MakeVRAMFlat_ABGCoherent(bgDirty);
+    }
+    else
+    {
+        auto bgDirty = GPU::VRAMDirty_BBG.DeriveState(GPU::VRAMMap_BBG);
+        GPU::MakeVRAMFlat_BBGCoherent(bgDirty);
+    }
+
     u8* vram; u32 vrammask;
     unit->GetBGVRAM(vram, vrammask);
     int bgheight = (int)((vrammask + 1) >> 10);   // VRAM rows = texture height
@@ -983,9 +1031,35 @@ void GLRenderer2D::UploadBGPalette(Unit* unit)
 {
     const int num = unit->Num;
 
+    // Sync extended palette flat buffers.
+    //
+    // The GL renderer coheres only ONCE per frame, whereas the SoftRenderer
+    // derives every scanline. melonDS's dirty tracking is incremental:
+    // DeriveState() copies dirty regions then CLEARS the per-bank dirty bits.
+    // Games like NSMB write their BG extended palette ONCE (static), so a single
+    // coarse once-per-frame consume can drop that lone dirty region — leaving the
+    // ext-pal flat buffer all-zero and the mode-5 hills washed/wrong (the std
+    // palette, which lives in dedicated RAM, was fine; only the VRAM-backed
+    // ext-pal broke). Force a full re-copy every frame by invalidating the
+    // tracker's recorded mapping first: Reset() sets Mapping[]=0x8000, so the
+    // next DeriveState() sees a mismatch on every slot and does a full SetRange
+    // copy of each mapped slot. ~32 KB/frame — correctness over deltas.
+    if (num == 0)
+    {
+        GPU::VRAMDirty_ABGExtPal.Reset();
+        auto epDirty = GPU::VRAMDirty_ABGExtPal.DeriveState(GPU::VRAMMap_ABGExtPal);
+        GPU::MakeVRAMFlat_ABGExtPalCoherent(epDirty);
+    }
+    else
+    {
+        GPU::VRAMDirty_BBGExtPal.Reset();
+        auto epDirty = GPU::VRAMDirty_BBGExtPal.DeriveState(GPU::VRAMMap_BBGExtPal);
+        GPU::MakeVRAMFlat_BBGExtPalCoherent(epDirty);
+    }
+
     // Standard BG palette (256 entries) then the 4 ext-pal slots × 16 palettes,
     // matching the PalTex_BG layout (rows: 0 = standard, 1.. = ext-pal).
-    static u16 temp[256 * (1 + 4 * 16)];
+    static u16 temp[kBGPalEntries];
     memcpy(&temp[0], &GPU::Palette[num ? 0x400 : 0], 256 * 2);
     for (int s = 0; s < 4; s++)
         for (int p = 0; p < 16; p++)
@@ -994,12 +1068,65 @@ void GLRenderer2D::UploadBGPalette(Unit* unit)
             memcpy(&temp[(1 + (s * 16) + p) * 256], pal, 256 * 2);
         }
 
+    // ── BGPAL-PROBE (one-shot, engine A, mode-5/ext-pal): dump the ACTUAL BG
+    // palette being uploaded, at the moment it is read. Ground truth for whether
+    // the hills SHOULD be vibrant. Scans for the first nonzero colours in the
+    // standard region (rows 0) and the ext-pal region (rows 1..). Remove later.
+    {
+        static bool bgpalProbe[2] = { false, false };
+        if (YAGE_MELONDS_GL_DIAG && !bgpalProbe[num] && num == 0 &&
+            (unit->DispCnt & (1u << 30)))
+        {
+            bgpalProbe[num] = true;
+            MELONDS_2D_LOG("BGPAL-PROBE u%d DispCnt=%08X bgExtPalEn=%d extPalMap=[%u,%u,%u,%u]",
+                           num, unit->DispCnt, !!(unit->DispCnt & (1u << 30)),
+                           GPU::VRAMMap_ABGExtPal[0], GPU::VRAMMap_ABGExtPal[1],
+                           GPU::VRAMMap_ABGExtPal[2], GPU::VRAMMap_ABGExtPal[3]);
+            // standard region (temp[0..255])
+            int shown = 0;
+            for (int i = 0; i < 256 && shown < 6; i++)
+            {
+                u16 c = temp[i];
+                if (!c) continue;
+                MELONDS_2D_LOG("BGPAL-PROBE std[%d]=0x%04X rgb=(%d,%d,%d)", i, c,
+                               (c & 0x1F) << 3, ((c >> 5) & 0x1F) << 3, ((c >> 10) & 0x1F) << 3);
+                shown++;
+            }
+            if (shown == 0) MELONDS_2D_LOG("BGPAL-PROBE std region ALL ZERO");
+            // ext-pal region (temp[256..])
+            shown = 0;
+            for (int i = 256; i < kBGPalEntries && shown < 10; i++)
+            {
+                u16 c = temp[i];
+                if (!c) continue;
+                int row = i / 256, ent = i % 256;
+                MELONDS_2D_LOG("BGPAL-PROBE ext row%d(slot%d pal%d) e%d=0x%04X rgb=(%d,%d,%d)",
+                               row, (row - 1) / 16, (row - 1) % 16, ent, c,
+                               (c & 0x1F) << 3, ((c >> 5) & 0x1F) << 3, ((c >> 10) & 0x1F) << 3);
+                shown++;
+            }
+            if (shown == 0) MELONDS_2D_LOG("BGPAL-PROBE ext region ALL ZERO");
+        }
+    }
+
+    // Skip swizzle + GPU upload when the palette data hasn't changed since the
+    // last upload. bionic's memcmp is NEON-vectorised (~7 µs for 33 KB) vs the
+    // swizzle loop + glTexSubImage2D (~350 µs). Most NDS games only change
+    // palettes on level transitions, so this saves work on the vast majority of
+    // rendered frames. The Reset+DeriveState+MakeFlat above must still run every
+    // frame (it keeps the flat VRAM buffer coherent with the VRAM bank writes).
+    if (PalBGValid[num] &&
+        memcmp(temp, PrevPalBG[num], sizeof(u16) * kBGPalEntries) == 0)
+        return;
+
+    memcpy(PrevPalBG[num], temp, sizeof(u16) * kBGPalEntries);
+    PalBGValid[num] = true;
+
     // GLES3 has no GL_UNSIGNED_SHORT_1_5_5_5_REV, so swizzle NDS BGR555 entries
     // into 5_5_5_1 layout at upload time (same as the GPU3D_OpenGL palette path):
     //   R(0x001F)<<11 | G(0x03E0)<<1 | B(0x7C00)>>9 | (top bit)->A
-    static u16 swiz[256 * (1 + 4 * 16)];
-    const int n = 256 * (1 + 4 * 16);
-    for (int i = 0; i < n; i++)
+    static u16 swiz[kBGPalEntries];
+    for (int i = 0; i < kBGPalEntries; i++)
     {
         u16 s = temp[i];
         swiz[i] = ((s & 0x001F) << 11) | ((s & 0x03E0) << 1) | ((s & 0x7C00) >> 9) | ((s >> 15) & 0x1);
@@ -1037,6 +1164,42 @@ void GLRenderer2D::PrerenderBGLayers(Unit* unit)
     UploadBGVRAM(unit);
     UploadBGPalette(unit);
 
+
+    // ── One-shot debug dump: first frame where at least one BG layer is enabled ──
+    static bool bgDumped[2]   = { false, false };
+    static bool pxDumped[2]   = { false, false };
+    bool doPixelReadback = false;
+    if (YAGE_MELONDS_GL_DIAG && !bgDumped[num] &&
+        ((unit->DispCnt >> 8) & 0x0F) != 0)
+    {
+        bgDumped[num]   = true;
+        doPixelReadback = true;
+        u8* vram; u32 vrammask;
+        unit->GetBGVRAM(vram, vrammask);
+        u32 scanLen = vrammask + 1;
+        int nonzero = 0;
+        if (vram) { for (u32 i = 0; i < scanLen; i++) if (vram[i]) nonzero++; }
+        MELONDS_2D_LOG("BG-DBG u%d (BG-enabled): DispCnt=%08X uVRAMMask=%u BGAct=%X vramNZ=%d/%u",
+                       num, unit->DispCnt, LayerConfig[num].uVRAMMask, BGLayerActive[num],
+                       nonzero, scanLen);
+        for (int l = 0; l < 4; l++)
+        {
+            if (!(BGLayerActive[num] & (1u << l))) continue;
+            auto& cfg = LayerConfig[num].uBGConfig[l];
+            u32 ts = BGVRAMRange[num][l][0], tsz = BGVRAMRange[num][l][1];
+            u32 ms = BGVRAMRange[num][l][2], msz = BGVRAMRange[num][l][3];
+            int tnz = 0, mnz = 0;
+            if (vram && ts != 0xFFFFFFFF && tsz > 0)
+                for (u32 i = ts; i < ts+tsz && i <= vrammask; i++) if (vram[i]) tnz++;
+            if (vram && ms != 0xFFFFFFFF && msz > 0)
+                for (u32 i = ms; i < ms+msz && i <= vrammask; i++) if (vram[i]) mnz++;
+            u8 tb0 = (ts != 0xFFFFFFFF && vram && ts <= vrammask) ? vram[ts] : 0xFF;
+            u8 mb0 = (ms != 0xFFFFFFFF && vram && ms <= vrammask) ? vram[ms] : 0xFF;
+            MELONDS_2D_LOG("  L%d type=%u size=%dx%d tOff=%u[%u] tNZ=%d t[0]=0x%02x mOff=%u[%u] mNZ=%d m[0]=0x%02x",
+                           l, cfg.Type, cfg.Size[0], cfg.Size[1], ts, tsz, tnz, tb0, ms, msz, mnz, mb0);
+        }
+    }
+
     if (!BGLayerActive[num]) return;
 
     glUseProgram(LayerPreShader[2]);
@@ -1058,6 +1221,22 @@ void GLRenderer2D::PrerenderBGLayers(Unit* unit)
     {
         if (!(BGLayerActive[num] & (1u << layer))) continue;
         PrerenderLayer(layer, unit);
+
+        // One-shot pixel readback on the first BG-enabled frame only.
+        if (doPixelReadback && !pxDumped[num])
+        {
+            glFinish();
+            u8 px[4] = {0, 0, 0, 0};
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, BGLayerFB[num][layer]);
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+            glReadPixels(4, 4, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            GL2D_CHK("readback");
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+            MELONDS_2D_LOG("  L%d pixel(4,4): r=%u g=%u b=%u a=%u", layer, px[0], px[1], px[2], px[3]);
+            if (layer == 3) pxDumped[num] = true;
+        }
     }
 }
 
@@ -1263,6 +1442,17 @@ void GLRenderer2D::UploadOBJVRAM(Unit* unit)
 {
     const int num = unit->Num;
 
+    if (num == 0)
+    {
+        auto objDirty = GPU::VRAMDirty_AOBJ.DeriveState(GPU::VRAMMap_AOBJ);
+        GPU::MakeVRAMFlat_AOBJCoherent(objDirty);
+    }
+    else
+    {
+        auto objDirty = GPU::VRAMDirty_BOBJ.DeriveState(GPU::VRAMMap_BOBJ);
+        GPU::MakeVRAMFlat_BOBJCoherent(objDirty);
+    }
+
     u8* vram; u32 vrammask;
     unit->GetOBJVRAM(vram, vrammask);
     int objheight = (int)((vrammask + 1) >> 10);   // VRAM rows = texture height
@@ -1279,16 +1469,40 @@ void GLRenderer2D::UploadOBJPalette(Unit* unit)
 {
     const int num = unit->Num;
 
-    static u16 temp[256 * (1 + 16)];
+    // Force a full re-copy every frame (see UploadBGPalette for the rationale):
+    // a static OBJ extended palette can be dropped by the once-per-frame
+    // incremental dirty consume, leaving ext-pal sprites mis-coloured.
+    if (num == 0)
+    {
+        GPU::VRAMDirty_AOBJExtPal.Reset();
+        auto epDirty = GPU::VRAMDirty_AOBJExtPal.DeriveState(&GPU::VRAMMap_AOBJExtPal);
+        GPU::MakeVRAMFlat_AOBJExtPalCoherent(epDirty);
+    }
+    else
+    {
+        GPU::VRAMDirty_BOBJExtPal.Reset();
+        auto epDirty = GPU::VRAMDirty_BOBJExtPal.DeriveState(&GPU::VRAMMap_BOBJExtPal);
+        GPU::MakeVRAMFlat_BOBJExtPalCoherent(epDirty);
+    }
+
+    static u16 temp[kOBJPalEntries];
     memcpy(&temp[0], &GPU::Palette[num ? 0x600 : 0x200], 256 * 2);
     {
         u16* pal = unit->GetOBJExtPal();
         memcpy(&temp[256], pal, 256 * 16 * 2);
     }
 
-    static u16 swiz[256 * (1 + 16)];
-    const int n = 256 * (1 + 16);
-    for (int i = 0; i < n; i++)
+    // Same change-detection optimisation as UploadBGPalette: skip when the
+    // source data is identical to the last uploaded version.
+    if (PalOBJValid[num] &&
+        memcmp(temp, PrevPalOBJ[num], sizeof(u16) * kOBJPalEntries) == 0)
+        return;
+
+    memcpy(PrevPalOBJ[num], temp, sizeof(u16) * kOBJPalEntries);
+    PalOBJValid[num] = true;
+
+    static u16 swiz[kOBJPalEntries];
+    for (int i = 0; i < kOBJPalEntries; i++)
     {
         u16 s = temp[i];
         swiz[i] = ((s & 0x001F) << 11) | ((s & 0x03E0) << 1) | ((s & 0x7C00) >> 9) | ((s >> 15) & 0x1);
@@ -1347,6 +1561,55 @@ void GLRenderer2D::PrerenderSprites(Unit* unit)
     glBufferSubData(GL_ARRAY_BUFFER, 0, vtxnum * 3 * sizeof(u16), SpritePreVtxData);
     glBindVertexArray(SpritePreVtxArray);
     glDrawArrays(GL_TRIANGLES, 0, vtxnum);
+
+    // ── OBJ-PROBE (one-shot, engine A): diagnose bluish sprite colours ──
+    // Samples the rendered atlas at each sprite's CENTRE (body colour, not the
+    // transparent corner), and dumps the raw NDS OBJ palette straight from
+    // memory (reliable) with the same NDS→RGB conversion the renderer uses, so
+    // atlas colours can be compared to ground truth. Remove once fixed.
+    {
+        static bool objProbe[2] = { false, false };
+        if (YAGE_MELONDS_GL_DIAG && !objProbe[num] && num == 0 &&
+            NumSprites[num] > 0)
+        {
+            objProbe[num] = true;
+            MELONDS_2D_LOG("OBJ-PROBE u%d DispCnt=%08X objExtPalEn=%d NumSpr=%d",
+                           num, unit->DispCnt, !!(unit->DispCnt & (1u << 31)),
+                           NumSprites[num]);
+
+            // Raw standard OBJ palette (engine A @ 0x200), first 8 entries.
+            // NDS BGR555: r=bits0-4, g=5-9, b=10-14. Logs raw + 8-bit RGB.
+            const u16* objpal = (const u16*)&GPU::Palette[0x200];
+            for (int e = 0; e < 8; e++)
+            {
+                u16 c = objpal[e];
+                int r = ((c)       & 0x1F) << 3;
+                int g = ((c >> 5)  & 0x1F) << 3;
+                int b = ((c >> 10) & 0x1F) << 3;
+                MELONDS_2D_LOG("OBJ-PROBE rawpal[%d]=0x%04X -> rgb=(%d,%d,%d)", e, c, r, g, b);
+            }
+
+            glFinish();
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, SpriteFB[num]);
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+
+            for (int s = 0; s < NumSprites[num] && s < 12; s++)
+            {
+                auto& o = SpriteConfig[num].uOAM[s];
+                // centre of this sprite's drawn content within its 64×64 cell
+                int cx = ((s & 0xF) * 64) + (o.Size[0] >> 1);
+                int cy = ((s >> 4) * 64) + (o.Size[1] >> 1);
+                GLubyte ap[4] = {0};
+                glReadPixels(cx, cy, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, ap);
+                MELONDS_2D_LOG("OBJ-PROBE spr[%d] Type=%u PalOff=%u OBJMode=%u "
+                               "Size=%dx%d atlasCtr=(%u,%u,%u,%u)",
+                               s, o.Type, o.PalOffset, o.OBJMode,
+                               o.Size[0], o.Size[1], ap[0], ap[1], ap[2], ap[3]);
+            }
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        }
+    }
 }
 
 // Composite the atlas into the OBJ layer for [LastSpriteLine, line). Two mosaic
@@ -1522,6 +1785,19 @@ void GLRenderer2D::UpdateCompositorConfig(Unit* unit)
         cfg.uBGPrio[layer] = unit->BGCnt[layer] & 0x3;
     }
 
+    // One-shot compositor dump on first frame with at least one BG layer enabled
+    // (logged after priority computation so BGpri shows current-frame values).
+    static bool compDumped[2] = { false, false };
+    if (YAGE_MELONDS_GL_DIAG && !compDumped[num] &&
+        (layerEnable & 0x0F) != 0)
+    {
+        compDumped[num] = true;
+        MELONDS_2D_LOG("COMP-DBG u%d (BG-enabled): DispCnt=%08X layerEnable=0x%X BGpri=%d/%d/%d/%d OBJen=%d",
+                       num, unit->DispCnt, layerEnable,
+                       cfg.uBGPrio[0], cfg.uBGPrio[1], cfg.uBGPrio[2], cfg.uBGPrio[3],
+                       !!(layerEnable & (1u << 4)));
+    }
+
     cfg.uEnableOBJ    = !!(layerEnable & (1u << 4));
     cfg.uEnable3D     = !!(unit->DispCnt & (1u << 3));
     cfg.uBlendCnt     = unit->BlendCnt;
@@ -1537,6 +1813,49 @@ void GLRenderer2D::UpdateCompositorConfig(Unit* unit)
 void GLRenderer2D::RenderScreen(int ystart, int yend, Unit* unit)
 {
     const int num = unit->Num;
+
+    // ── ARCH-DBG: architecture-state probe (remove once feature gaps closed) ──
+    // Logs the display-engine features the GL2D renderer does NOT yet implement
+    // (alt display modes, display capture) so we can tell which test games hit
+    // them. Fires on the first frame, on any dispmode/capture-enable CHANGE, and
+    // as a heartbeat every 300 frames per unit.
+    if (YAGE_MELONDS_GL_DIAG)
+    {
+        static u32  lastDispMode[2] = { 0xFFFFFFFF, 0xFFFFFFFF };
+        static u32  lastCapEn[2]    = { 0xFFFFFFFF, 0xFFFFFFFF };
+        static int  archFrame[2]    = { 0, 0 };
+        u32 dispmode = (unit->DispCnt >> 16) & (num ? 0x1u : 0x3u);
+        u32 capEn    = (num == 0) ? (unit->CaptureCnt >> 31) : 0;
+        bool changed = (dispmode != lastDispMode[num]) || (capEn != lastCapEn[num]);
+        if (changed || (archFrame[num] % 300) == 0)
+        {
+            const char* dmName = (dispmode==0)?"OFF":(dispmode==1)?"NORMAL":
+                                 (dispmode==2)?"VRAM":"FIFO";
+            u32 cc = unit->CaptureCnt;
+            static const char* capSizeName[4] = {"128x128","256x64","256x128","256x192"};
+            MELONDS_2D_LOG("ARCH u%d f=%d dispmode=%u(%s) DispCnt=%08X "
+                           "mbright=%u/%u%s",
+                           num, archFrame[num], dispmode, dmName, unit->DispCnt,
+                           (unit->MasterBrightness >> 14) & 0x3,
+                           unit->MasterBrightness & 0x1F,
+                           changed ? " [CHANGED]" : "");
+            if (num == 0)
+                MELONDS_2D_LOG("ARCH u0 capture: en=%u srcA=%s srcB=%s capsrc=%u "
+                               "size=%s dstblk=%u rdblk=%u lcdc=0x%X fifo=%d",
+                               capEn,
+                               (cc & (1u<<24)) ? "3Donly" : "2D+3D",
+                               (cc & (1u<<25)) ? "mainmem" : "VRAM",
+                               (cc >> 29) & 0x3,
+                               capSizeName[(cc >> 20) & 0x3],
+                               (cc >> 16) & 0x3,
+                               (unit->DispCnt >> 18) & 0x3,
+                               GPU::VRAMMap_LCDC,
+                               (int)unit->UsesFIFO());
+        }
+        lastDispMode[num] = dispmode;
+        lastCapEn[num]    = capEn;
+        archFrame[num]++;
+    }
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OutputFB[num]);
@@ -1554,17 +1873,19 @@ void GLRenderer2D::RenderScreen(int ystart, int yend, Unit* unit)
 
     bool forcedBlank  = !!(unit->DispCnt & (1u << 7));
     bool unitEnabled  = unit->Enabled;
+    // DispCnt[17:16] = display mode: 0=off(black), 1=normal, 2=VRAM(A-only),
+    // 3=FIFO(A-only). Mode 0 disables the screen entirely (independent of
+    // forced-blank bit 7). Common during scene transitions; output is black.
+    u32  dispmode     = (unit->DispCnt >> 16) & (num ? 0x1u : 0x3u);
 
-    if (forcedBlank || !unitEnabled)
+    if (forcedBlank || !unitEnabled || dispmode == 0)
     {
-        // forced blank → white; disabled engine → black (A) / white (B).
-        if (!unitEnabled)
-        {
-            if (num) glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
-            else     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        }
-        else
+        // forced blank (bit 7) → white per NDS spec.
+        // screen off (dispmode=0) or engine disabled → black.
+        if (forcedBlank)
             glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+        else
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 
         glClear(GL_COLOR_BUFFER_BIT);
         glDisable(GL_SCISSOR_TEST);
@@ -1591,7 +1912,86 @@ void GLRenderer2D::RenderScreen(int ystart, int yend, Unit* unit)
 
         // BG0 samples the GPU3D output when the 3D layer is enabled.
         if ((i == 0) && (unit->DispCnt & (1u << 3)))
-            glBindTexture(GL_TEXTURE_2D, Output3DTex);
+        {
+            Output3DTex = (GLuint)GPU::Get3DOutputTexture();
+            bool bound3D = GPU::Bind3DOutputTexture();
+            if (!bound3D)
+                glBindTexture(GL_TEXTURE_2D, 0);
+
+            static bool threeDDumped[2] = { false, false };
+            if (YAGE_MELONDS_GL_DIAG && !threeDDumped[num])
+            {
+                threeDDumped[num] = true;
+                MELONDS_2D_LOG("3D-HOOK u%d DispCnt=%08X tex=%u bound=%d BG0prio=%u blend=%04X",
+                               num, unit->DispCnt, Output3DTex, (int)bound3D,
+                               CompositorConfig[num].uBGPrio[0], unit->BlendCnt);
+            }
+
+            // Opening-scene GPU3D texture probe: fires at frame 120 of the opening
+            // (DispCnt==0x00011F08) to sample both FrontBuffer and FrontBuffer^1.
+            // Logs: content (alpha / RGB) at 5 y-positions for BOTH buffers.
+            static int openingFrameCount[2] = { 0, 0 };
+            static bool openingProbeDone[2] = { false, false };
+            if (unit->DispCnt == 0x00011F08) openingFrameCount[num]++;
+            if (YAGE_MELONDS_GL_DIAG &&
+                !openingProbeDone[num] && openingFrameCount[num] >= 120
+                && unit->DispCnt == 0x00011F08 && bound3D && Output3DTex != 0)
+            {
+                openingProbeDone[num] = true;
+                // Access GPU3D renderer to sample both FramebufferTex slots.
+                auto* gl3d = GPU3D::CurrentRenderer
+                    ? reinterpret_cast<GPU3D::GLRenderer*>(GPU3D::CurrentRenderer.get())
+                    : nullptr;
+                if (gl3d)
+                {
+                    GLuint fbTex[2] = {
+                        gl3d->GetAccelFrameTexture(),     // FrontBuffer^1 (current)
+                        0,
+                    };
+                    // Determine the OTHER slot (FrontBuffer instead of FrontBuffer^1)
+                    // by noting which tex is bound and picking the companion.
+                    GLuint tex0 = gl3d->GetFramebufferTex(0);
+                    GLuint tex1 = gl3d->GetFramebufferTex(1);
+                    fbTex[1] = (fbTex[0] == tex0) ? tex1 : tex0;
+
+                    static const int probeYs[5] = { 20, 60, 96, 130, 170 };
+                    for (int bi = 0; bi < 2; bi++)
+                    {
+                        GLuint probeFBO;
+                        glGenFramebuffers(1, &probeFBO);
+                        GLint prevRFBO = 0;
+                        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevRFBO);
+                        glBindFramebuffer(GL_READ_FRAMEBUFFER, probeFBO);
+                        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                               GL_TEXTURE_2D, fbTex[bi], 0);
+                        GLenum fbs = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+                        if (fbs == GL_FRAMEBUFFER_COMPLETE)
+                        {
+                            glReadBuffer(GL_COLOR_ATTACHMENT0);
+                            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+                            char logbuf[256];
+                            int off = snprintf(logbuf, sizeof(logbuf),
+                                               "3D-SCAN u%d buf=%s tex=%u:",
+                                               num,
+                                               bi==0 ? "FB^1" : "FB",
+                                               fbTex[bi]);
+                            for (int yi = 0; yi < 5; yi++)
+                            {
+                                GLubyte px[4] = {0};
+                                glReadPixels(128, probeYs[yi], 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                                off += snprintf(logbuf+off, sizeof(logbuf)-off,
+                                                " y%d=(%u,%u,%u,%u)",
+                                                probeYs[yi], px[0], px[1], px[2], px[3]);
+                            }
+                            MELONDS_2D_LOG("%s", logbuf);
+                        }
+                        glDeleteFramebuffers(1, &probeFBO);
+                        glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prevRFBO);
+                    }
+                }
+            }
+
+        }
         else
             glBindTexture(GL_TEXTURE_2D, BGLayerTex[num][i]);
 
@@ -1618,6 +2018,104 @@ void GLRenderer2D::RenderScreen(int ystart, int yend, Unit* unit)
     glDrawArrays(GL_TRIANGLES, 0, 2 * 3);
 
     glDisable(GL_SCISSOR_TEST);
+
+    // ── LAYER-PROBE (one-shot, engine A): separate the wash by layer ──
+    // The sprite atlas is already proven correct, but the final output is washed
+    // pastel. This reads THREE layers at the same points to localise the wash:
+    //   OBJ  = OBJLayerTex[0]      (composited sprite colour, real RGB)
+    //   3D   = GPU3D output tex    (BG0 source, real RGB)
+    //   OUT  = OutputTex           (final; stored .bgr → logged un-swizzled as RGB)
+    // Scans a vertical centre column (maps the scene + resolves any Y-flip) plus
+    // the character row. Remove once the colour issue is fixed.
+    if (num == 0)
+    {
+        static int outFrame = 0;
+        static bool outProbe = false;
+        if (unit->DispCnt == 0x00011F08 || (unit->DispCnt & 0x7) == 5) outFrame++;
+        if (YAGE_MELONDS_GL_DIAG && !outProbe && outFrame >= 200)
+        {
+            outProbe = true;
+            glFinish();
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+
+            GLuint tmpFBO; glGenFramebuffers(1, &tmpFBO);
+            GLuint tex3d = (GLuint)GPU::Get3DOutputTexture();
+            MELONDS_2D_LOG("LAYER-PROBE tex3d=%u (0=null read invalid)", tex3d);
+
+            // Ground truth: raw BG palettes straight from memory (NDS BGR555).
+            // If these are vibrant but OUT is washed → bug is in BG rendering.
+            const u16* bgpal = (const u16*)&GPU::Palette[0x000];   // engine A BG std pal
+            for (int e = 0; e < 8; e++)
+            {
+                u16 c = bgpal[e];
+                MELONDS_2D_LOG("LAYER-PROBE bgStdPal[%d]=0x%04X rgb=(%d,%d,%d)", e, c,
+                               (c & 0x1F) << 3, ((c >> 5) & 0x1F) << 3, ((c >> 10) & 0x1F) << 3);
+            }
+            // BG extended palettes (mode 5 hills use these): slots 0-3, pal 0, a few entries.
+            for (int s = 0; s < 4; s++)
+            {
+                u16* ep = unit->GetBGExtPal(s, 0);
+                if (!ep) { MELONDS_2D_LOG("LAYER-PROBE bgExtPal slot%d = NULL", s); continue; }
+                MELONDS_2D_LOG("LAYER-PROBE bgExtPal slot%d pal0 e1..4: "
+                               "0x%04X 0x%04X 0x%04X 0x%04X", s, ep[1], ep[2], ep[3], ep[4]);
+            }
+            // Read the prerendered BG hill layers directly (BGLayerTex[1..3]) at a
+            // couple of texture coords — are they washed at the prerender stage?
+            for (int L = 1; L <= 3; L++)
+            {
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, BGLayerFB[num][L]);
+                glReadBuffer(GL_COLOR_ATTACHMENT0);
+                GLubyte a[4]={0}, b[4]={0};
+                glReadPixels(128, 128, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, a);
+                glReadPixels(64, 200, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, b);
+                MELONDS_2D_LOG("LAYER-PROBE BGLayerTex[%d] (128,128)=(%u,%u,%u,%u) (64,200)=(%u,%u,%u,%u)",
+                               L, a[0],a[1],a[2],a[3], b[0],b[1],b[2],b[3]);
+            }
+
+            // points: a centre column (y sweep) then the character row (x sweep)
+            static const int pts[][2] = {
+                {128, 16}, {128, 48}, {128, 80}, {128, 112}, {128, 144}, {128, 176},
+                {26, 150}, {58, 150}, {85, 150}, {190, 150},
+            };
+            const int NP = 10;
+            for (int p = 0; p < NP; p++)
+            {
+                int x = pts[p][0] * ScaleFactor;
+                int y = pts[p][1] * ScaleFactor;
+                GLubyte obj[4] = {0}, d3[4] = {0}, out[4] = {0};
+
+                // OBJ sprite layer (2D array layer 0)
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, tmpFBO);
+                glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                          OBJLayerTex[num], 0, 0);
+                if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE)
+                { glReadBuffer(GL_COLOR_ATTACHMENT0); glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, obj); }
+
+                // 3D layer (BG0 source)
+                if (tex3d)
+                {
+                    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                           GL_TEXTURE_2D, tex3d, 0);
+                    if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE)
+                    { glReadBuffer(GL_COLOR_ATTACHMENT0); glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, d3); }
+                }
+
+                // final OutputTex (stored .bgr → un-swizzle to real RGB for logging)
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, OutputFB[num]);
+                glReadBuffer(GL_COLOR_ATTACHMENT0);
+                glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, out);
+
+                MELONDS_2D_LOG("LAYER-PROBE (%3d,%3d) OBJ=(%u,%u,%u,%u) 3D=(%u,%u,%u,%u) OUTrgb=(%u,%u,%u)",
+                               pts[p][0], pts[p][1],
+                               obj[0],obj[1],obj[2],obj[3],
+                               d3[0],d3[1],d3[2],d3[3],
+                               out[2],out[1],out[0]);   // un-swizzle .bgr→rgb
+            }
+            glDeleteFramebuffers(1, &tmpFBO);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        }
+    }
 }
 
 // ── Rendering: the GPU 2D pipeline drives the frame (C4.2) ─────────────────
@@ -1634,6 +2132,49 @@ void GLRenderer2D::SetFramebuffer(u32* unitA, u32* unitB)
 {
     Framebuffer[0] = unitA;
     Framebuffer[1] = unitB;
+
+    int screenForUnit[2] = { -1, -1 };
+    for (int fb = 0; fb < 2; fb++)
+    {
+        for (int screen = 0; screen < 2; screen++)
+        {
+            if (unitA && unitA == GPU::Framebuffer[fb][screen])
+                screenForUnit[0] = screen;
+            if (unitB && unitB == GPU::Framebuffer[fb][screen])
+                screenForUnit[1] = screen;
+        }
+    }
+
+    int newScreenUnit[2] = { OutputScreenUnit[0], OutputScreenUnit[1] };
+    if (screenForUnit[0] >= 0)
+        newScreenUnit[screenForUnit[0]] = 0;
+    if (screenForUnit[1] >= 0)
+        newScreenUnit[screenForUnit[1]] = 1;
+
+    static int lastLogScreenUnit[2] = { -1, -1 };
+    if (newScreenUnit[0] != OutputScreenUnit[0] ||
+        newScreenUnit[1] != OutputScreenUnit[1])
+    {
+        OutputScreenUnit[0] = newScreenUnit[0];
+        OutputScreenUnit[1] = newScreenUnit[1];
+    }
+    if (lastLogScreenUnit[0] != OutputScreenUnit[0] ||
+        lastLogScreenUnit[1] != OutputScreenUnit[1])
+    {
+        lastLogScreenUnit[0] = OutputScreenUnit[0];
+        lastLogScreenUnit[1] = OutputScreenUnit[1];
+        MELONDS_2D_LOG("PRES-MAP top=u%d bottom=u%d", OutputScreenUnit[0], OutputScreenUnit[1]);
+    }
+}
+
+void GLRenderer2D::BindOutputTexture(int unit)
+{
+    glBindTexture(GL_TEXTURE_2D, OutputTex[unit & 1]);
+}
+
+void GLRenderer2D::BindOutputTextureForScreen(int screen)
+{
+    BindOutputTexture(OutputScreenUnit[screen & 1]);
 }
 
 void GLRenderer2D::DrawScanline(u32 line, Unit* unit)
@@ -1686,42 +2227,28 @@ void GLRenderer2D::RenderFrame(Unit* unit)
     LastSpriteLine[num] = 0;
     DoRenderSprites(192, unit);  GL2D_CHK("DoRenderSprites");
 
-    // Composite BG + OBJ (+ 3D as BG0) into OutputTex. 3D-layer hook deferred
-    // (v1): Output3DTex stays 0, so a 3D BG0 samples empty — pure-2D content is
-    // correct; a 3D game's 3D plane is blank until the hook lands (§15.8).
+    // Composite BG + OBJ (+ GPU3D as BG0) into OutputTex.
     LastLine[num] = 0;
     RenderScreen(0, 192, unit);  GL2D_CHK("RenderScreen");
 
-    // v1 display: read the composited screen back into the CPU backbuffer so the
-    // existing libretro (software-upload) present path shows it. To be replaced
-    // by a direct OutputTex blit (no readback) once correctness is validated.
-    //
-    // Fix: RenderScreen leaves GL_DRAW_FRAMEBUFFER = OutputFB[num]. On Adreno
-    // GLES3 drivers glReadPixels returns GL_INVALID_OPERATION when read and draw
-    // are both bound to the same non-default FBO (feedback-loop guard). Unbind
-    // the draw target first so the readback has no feedback-loop conflict.
-    if (Framebuffer[num])
-    {
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, OutputFB[num]);
-        glReadPixels(0, 0, 256, 192, GL_RGBA, GL_UNSIGNED_BYTE, Framebuffer[num]);
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-        GL2D_CHK("RenderFrame:readback");
-    }
+    // Present is handled by libretro/opengl.cpp sampling OutputTex directly.
+    // Do not glReadPixels here: several GLES drivers reject readback from these
+    // render targets and the CPU framebuffer is not part of the GL2D hot path.
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    GL2D_CHK("RenderFrame:present-ready");
 
     // TEMP one-shot per-unit state dump: tells us whether a black screen is a
     // forced-blank/disabled engine, no active layers, or a genuinely empty
     // composite (centerPx = middle pixel of the read-back screen).
     static bool dumped[2] = { false, false };
-    if (!dumped[num])
+    if (YAGE_MELONDS_GL_DIAG && !dumped[num])
     {
         dumped[num] = true;
-        u32 cp = Framebuffer[num] ? Framebuffer[num][96 * 256 + 128] : 0;
         MELONDS_2D_LOG("2D-STATE u%d DispCnt=%08X En=%d fblank=%d BGAct=%X NumSpr=%d "
-                       "Out3D=%u OutFB=%u centerPx=%08X",
+                       "Out3D=%u OutFB=%u OutTex=%u",
                        num, unit->DispCnt, (int)unit->Enabled,
                        (int)!!(unit->DispCnt & (1u << 7)), BGLayerActive[num],
-                       NumSprites[num], Output3DTex, OutputFB[num], cp);
+                       NumSprites[num], Output3DTex, OutputFB[num], OutputTex[num]);
     }
 }
 

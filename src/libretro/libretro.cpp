@@ -245,6 +245,16 @@ void retro_set_environment(retro_environment_t cb)
    else
       log_cb = fallback_log;
 
+#ifdef JIT_ENABLED
+#if defined(__arm__) && !defined(__aarch64__)
+   log_cb(RETRO_LOG_INFO, "melonDS JIT: armeabi-v7a/AArch32 JIT backend active (Thumb ALU/address native slice + branch/memory helpers; 8-instr straight-line blocks; fastmem disabled)\n");
+#elif defined(__aarch64__)
+   log_cb(RETRO_LOG_INFO, "melonDS JIT: arm64-v8a/AArch64 backend active.\n");
+#elif defined(__x86_64__)
+   log_cb(RETRO_LOG_INFO, "melonDS JIT: x86_64 backend active.\n");
+#endif
+#endif
+
    static const struct retro_controller_description controllers[] = {
       { "Nintendo DS", RETRO_DEVICE_JOYPAD },
       { NULL, 0 },
@@ -665,10 +675,9 @@ static void render_frame(void)
 #ifdef HAVE_OPENGL
    if(using_opengl)
    {
-      // GPU 2D renderer (C4.2 v1): it composites into OutputTex and reads the
-      // result back into GPU::Framebuffer, so present via the software-upload
-      // path. (The 3D GLCompositor still runs but its output is unused while
-      // GL2DActive; a direct OutputTex blit replaces this readback at C5.)
+      // GPU 2D renderer composites into per-screen OutputTex objects; the GL
+      // present path samples those textures directly and avoids GPU→CPU
+      // readback.
       if (GPU::GL2DActive || current_renderer == CurrentRenderer::Software)
          render_opengl_frame(true);
       else
@@ -720,6 +729,16 @@ static void render_frame(void)
 #endif
 }
 
+static bool frontend_video_enabled(void)
+{
+   int av_enable = 0x3; // video + audio enabled by default
+   if (environ_cb &&
+       environ_cb(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE, &av_enable))
+      return (av_enable & 0x1) != 0;
+
+   return true;
+}
+
 void retro_run(void)
 {
    update_input(&input_state);
@@ -761,9 +780,14 @@ void retro_run(void)
       NDS::MicInputFrame(NULL, 0);
    }
 
-   if (current_renderer != CurrentRenderer::None) NDS::RunFrame();
+   const bool video_enabled = frontend_video_enabled();
 
-   render_frame();
+   GPU::SkipFrameRendering = !video_enabled;
+   if (current_renderer != CurrentRenderer::None) NDS::RunFrame();
+   GPU::SkipFrameRendering = false;
+
+   if (video_enabled)
+      render_frame();
 
    audio_callback();
 
