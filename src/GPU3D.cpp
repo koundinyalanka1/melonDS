@@ -18,6 +18,11 @@
 
 #include <stdio.h>
 #include <string.h>
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#define GPU3D_HAS_NEON 1
+#endif
 #include <algorithm>
 #include "NDS.h"
 #include "GPU.h"
@@ -662,12 +667,43 @@ void MatrixLoad4x3(s32* m, s32* s)
     m[12] = s[9]; m[13] = s[10]; m[14] = s[11]; m[15] = 0x1000;
 }
 
-void MatrixMult4x4(s32* m, s32* s)
+#ifdef GPU3D_HAS_NEON
+static inline void MatrixMult4x4_NEON(s32* m, const s32* s)
 {
     s32 tmp[16];
     memcpy(tmp, m, 16*4);
 
-    // m = s*m
+    for (int row = 0; row < 4; row++)
+    {
+        int32x2_t s0 = vdup_n_s32(s[row*4 + 0]);
+        int32x2_t s1 = vdup_n_s32(s[row*4 + 1]);
+        int32x2_t s2 = vdup_n_s32(s[row*4 + 2]);
+        int32x2_t s3 = vdup_n_s32(s[row*4 + 3]);
+
+        int64x2_t acc_lo = vmull_s32(s0, vld1_s32(&tmp[0]));
+        acc_lo = vmlal_s32(acc_lo, s1, vld1_s32(&tmp[4]));
+        acc_lo = vmlal_s32(acc_lo, s2, vld1_s32(&tmp[8]));
+        acc_lo = vmlal_s32(acc_lo, s3, vld1_s32(&tmp[12]));
+
+        int64x2_t acc_hi = vmull_s32(s0, vld1_s32(&tmp[2]));
+        acc_hi = vmlal_s32(acc_hi, s1, vld1_s32(&tmp[6]));
+        acc_hi = vmlal_s32(acc_hi, s2, vld1_s32(&tmp[10]));
+        acc_hi = vmlal_s32(acc_hi, s3, vld1_s32(&tmp[14]));
+
+        vst1_s32(&m[row*4 + 0], vshrn_n_s64(acc_lo, 12));
+        vst1_s32(&m[row*4 + 2], vshrn_n_s64(acc_hi, 12));
+    }
+}
+#endif
+
+void MatrixMult4x4(s32* m, s32* s)
+{
+#ifdef GPU3D_HAS_NEON
+    MatrixMult4x4_NEON(m, s);
+#else
+    s32 tmp[16];
+    memcpy(tmp, m, 16*4);
+
     m[0] = ((s64)s[0]*tmp[0] + (s64)s[1]*tmp[4] + (s64)s[2]*tmp[8] + (s64)s[3]*tmp[12]) >> 12;
     m[1] = ((s64)s[0]*tmp[1] + (s64)s[1]*tmp[5] + (s64)s[2]*tmp[9] + (s64)s[3]*tmp[13]) >> 12;
     m[2] = ((s64)s[0]*tmp[2] + (s64)s[1]*tmp[6] + (s64)s[2]*tmp[10] + (s64)s[3]*tmp[14]) >> 12;
@@ -687,6 +723,7 @@ void MatrixMult4x4(s32* m, s32* s)
     m[13] = ((s64)s[12]*tmp[1] + (s64)s[13]*tmp[5] + (s64)s[14]*tmp[9] + (s64)s[15]*tmp[13]) >> 12;
     m[14] = ((s64)s[12]*tmp[2] + (s64)s[13]*tmp[6] + (s64)s[14]*tmp[10] + (s64)s[15]*tmp[14]) >> 12;
     m[15] = ((s64)s[12]*tmp[3] + (s64)s[13]*tmp[7] + (s64)s[14]*tmp[11] + (s64)s[15]*tmp[15]) >> 12;
+#endif
 }
 
 void MatrixMult4x3(s32* m, s32* s)

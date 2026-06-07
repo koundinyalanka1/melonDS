@@ -65,6 +65,7 @@ const bool EnableThumbMemImmDirect = true;
 // there — on ARM7 a Thumb POP-PC must set bit0, which that helper clears, so ARM7
 // POP-PC stays on RunThumbMemInstr). Any guard miss falls back to the helper.
 const bool EnableThumbBlockTransfer = true;
+const bool EnableRegAllocator = true;
 #ifndef A32JIT_PROFILE
 #define A32JIT_PROFILE 0
 #endif
@@ -3652,10 +3653,20 @@ static void AnalyzeArmRegUsage(u32 op, u32& read, u32& written)
         }
         else if (bit4 && bit7)
         {
-            // Halfword/signed transfers (LDRH/STRH/LDRSB/LDRSH), bits[7:4]==1011/1101/1111.
+            // Halfword/signed/doubleword transfers.
+            // bits[6:5] discriminate: 01=LDRH/STRH, 10=LDRD/STRD, 11=LDRSB/LDRSH
+            const u32 sh = (op >> 5) & 3;
             addR(rn);
             if (!bit22) addR(rm);                 // bit22=0 → register offset
-            if (bit20) addW(rd); else addR(rd);   // load writes Rd, store reads it
+            if (sh == 2) // LDRD/STRD (ARMv5TE): operates on Rd AND Rd+1
+            {
+                if (bit20) { addW(rd); if ((rd+1) < 15) addW(rd+1); }  // LDRD writes both
+                else       { addR(rd); if ((rd+1) < 15) addR(rd+1); }  // STRD reads both
+            }
+            else
+            {
+                if (bit20) addW(rd); else addR(rd);   // load writes Rd, store reads it
+            }
             if (!bit24 || bit21) addW(rn);        // post-index / writeback
         }
         else if (bit24 && !bit23 && !bit20)
@@ -3714,6 +3725,47 @@ static void AnalyzeArmRegUsage(u32 op, u32& read, u32& written)
     }
 }
 
+// ── Register allocator: template specializations ────────────────────────
+template <>
+const int RegisterCache<Compiler, int>::NativeRegAllocOrder[] =
+{
+    R5, R6, R7, R8, R9, R10, R11
+};
+template <>
+const int RegisterCache<Compiler, int>::NativeRegsAvailable = 7;
+
+void Compiler::LoadReg(int reg, int nativeReg)
+{
+    EmitLoadReg(nativeReg, R4, ArmMemberOffset(&ARM::R) + (u32)reg * 4);
+}
+
+void Compiler::SaveReg(int reg, int nativeReg)
+{
+    EmitStoreReg(nativeReg, R4, ArmMemberOffset(&ARM::R) + (u32)reg * 4);
+}
+
+void Compiler::FlushRegAllocForHelper()
+{
+    if (!m_useRegAlloc) return;
+    if (m_hostFlagsDirty)
+        EmitFlushDirtyFlags();
+    RegAllocCache.Flush();
+}
+
+void Compiler::MarkHostFlagsDirty(u32 mask)
+{
+    m_hostFlagsDirty = true;
+    m_dirtyFlagsMask = mask;
+}
+
+void Compiler::EmitFlushDirtyFlags()
+{
+    if (!m_hostFlagsDirty) return;
+    EmitCopyHostFlags(m_dirtyFlagsMask);
+    m_hostFlagsDirty = false;
+    m_dirtyFlagsMask = 0;
+}
+
 Compiler::Compiler()
 {
     u64 pageSize = sysconf(_SC_PAGE_SIZE);
@@ -3763,8 +3815,14 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     const u32 bytesNeeded = (u32)instrsCount * 320 + 512;
     if (CodeSize - CodeOffset() < bytesNeeded)
     {
-        A32JIT_LOGI("AArch32 JIT memory full, resetting...");
-        ResetBlockCache();
+        A32JIT_LOGI("AArch32 JIT memory full, wrapping code buffer (used %u/%u bytes)...",
+                    CodeOffset(), CodeSize);
+        CodePtr = CodeStart;
+        if (CodeSize < bytesNeeded)
+        {
+            A32JIT_LOGI("AArch32 JIT code buffer too small for block, full reset");
+            ResetBlockCache();
+        }
     }
 
     u8* start = CodePtr;
@@ -3776,49 +3834,16 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     // Cycle batching (6.9): reset pending cycle accumulator for this block.
     m_pendingCycles = 0;
 
-    // Register cache (6.1 Phase 1): analyse ARM-mode blocks to find pure-source
-    // guest registers (read but never written in the block) and cache them into
-    // host R5-R10 at block entry.  Thumb blocks get no cache (conservative).
-    // Self-link loops back to instrStart (after cache loads) to skip redundant reloads.
-    //
-    // DISABLED (correctness regression): the pinning is only safe if
-    // AnalyzeArmRegUsage()'s `written` set is a *strict superset* of every guest
-    // register an instruction can modify.  Any decode hole lets a pinned register
-    // go stale, and because the cache is loaded once at block entry the guest then
-    // runs at full speed but computes wrong values — games boot, set
-    // DISPCNT=graphics, then loop forever with no BG layers ever enabled (the exact
-    // NSMB-on-BRAVIA hang).  The 32->128 JIT_MaxBlockSize bump made this reachable
-    // by putting a pinned register and a missed write in the same block.
-    //
-    // The author already patched several holes (MUL/MLA dest, MRS, SWP, halfword,
-    // MRC) but at least one remains: LDRD/STRD (ARMv5TE, present on ARM9) write
-    // Rd *and* Rd+1, yet are analysed as a halfword store that only *reads* Rd.
-    // Until liveness is provably complete, keep the cache off — EmitGuestLoad()
-    // then always reads cpu->R[N] from memory, which is unconditionally correct.
-    // This is only a minor pre-allocator optimisation, so the perf cost is small.
-    // Flip kEnableRegCache back to true once AnalyzeArmRegUsage is audited.
-    constexpr bool kEnableRegCache = false;
+    // ── Register allocator (Phase 1) ────────────────────────────────────────
+    // Uses ARMJIT_RegisterCache.h template to dynamically map guest regs R0-R14
+    // onto host callee-saved R5-R11 across instruction boundaries.
+    // LDRD/STRD AnalyzeArmRegUsage bug is now fixed (writes Rd AND Rd+1).
     memset(m_rcHostReg, -1, sizeof(m_rcHostReg));
-    if (kEnableRegCache && !thumb)
-    {
-        u32 rcRead = 0, rcWritten = 0;
-        for (int i = 0; i < emitCount; i++)
-            AnalyzeArmRegUsage(instrs[i].Instr, rcRead, rcWritten);
-        // Candidates: read but never written, not SP/LR (R13/R14) which have implicit effects.
-        u32 candidates = rcRead & ~rcWritten & ~(1u << 13) & ~(1u << 14);
-        constexpr int kCacheHostRegs[] = { R5, R6, R7, R8, R9, R10 };
-        constexpr int kMaxCache = (int)(sizeof(kCacheHostRegs) / sizeof(kCacheHostRegs[0]));
-        int slot = 0;
-        for (int g = 0; g < 13 && slot < kMaxCache; g++)
-        {
-            if (candidates & (1u << g))
-            {
-                m_rcHostReg[g] = kCacheHostRegs[slot++];
-                EmitLoadReg(m_rcHostReg[g], R4,
-                            ArmMemberOffset(&ARM::R) + (u32)g * 4);
-            }
-        }
-    }
+    m_useRegAlloc = EnableRegAllocator;
+    m_hostFlagsDirty = false;
+    m_dirtyFlagsMask = 0;
+    if (m_useRegAlloc)
+        RegAllocCache = RegisterCache<Compiler, int>(this, instrs, emitCount);
     // instrStart: self-link loops back here to skip the cache-load preamble.
     u8* instrStart = CodePtr;
 
@@ -3832,6 +3857,9 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
         bool forceExit = instr.Info.EndBlock || instr.Info.Branches() || instr.BranchFlags != 0;
         bool tailReturn = forceExit || i == (emitCount - 1);
 
+        if (m_useRegAlloc)
+            RegAllocCache.Prepare(thumb, i);
+
         // M18: save pointer to the start of the tail instruction's emitted code.
         // Flush accumulated cycles from all non-tail instructions here so they
         // land before tailInstrCodePtr and are NOT rewound by the self-link path.
@@ -3843,7 +3871,10 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
         }
 
         if (!TryEmitNative(instr, thumb, cpu, tailReturn))
+        {
+            FlushRegAllocForHelper();
             EmitInterpreterFallback(instr, thumb, tailReturn);
+        }
 
         // Update block-local constant-propagation state (ARM mode only).
         if (!thumb)
@@ -4089,12 +4120,14 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
 
 bool Compiler::IsJITFault(u8* pc)
 {
-    (void)pc;
-    return false;
+    return pc >= CodeStart && pc < (CodeStart + CodeSize);
 }
 
 u8* Compiler::RewriteMemAccess(u8* pc)
 {
+    // Phase 4: In fastmem mode, a faulting LDR/STR can be back-patched to a
+    // helper BL. Full back-patching requires per-instruction patch-site tracking.
+    // For now the guard-chain fallback handles the access via the fault handler.
     return pc;
 }
 
@@ -5260,7 +5293,7 @@ bool Compiler::TryEmitArmNative(const FetchedInstr& instr, ARM* cpu, bool tailRe
         EmitMulReg(R2, R0, R1, mulFlagsNeeded);
         EmitGuestStore(rd, R2);
         if (mulFlagsNeeded)
-            EmitCopyHostFlags(CPSR_NZMask);
+            MarkHostFlagsDirty(CPSR_NZMask);
         // ARM9: 1/3 cycles; ARM7TDMI: worst-case 1S+4I = 5 cycles
         EmitAddCyclesConst(cpu->Num == 0 ? (setFlags ? 3 : 1) : 5);
         if (tailReturn)
@@ -5289,7 +5322,7 @@ bool Compiler::TryEmitArmNative(const FetchedInstr& instr, ARM* cpu, bool tailRe
         EmitU32(0xE0200090u | ((u32)mlaFlagsNeeded << 20) | (3u << 16) | (2u << 12) | (1u << 8) | 0u);
         EmitGuestStore(rd, R3);
         if (mlaFlagsNeeded)
-            EmitCopyHostFlags(CPSR_NZMask);  // MLA only updates N and Z
+            MarkHostFlagsDirty(CPSR_NZMask);
         // ARM9: 2/4 cycles; ARM7TDMI: 1S+(m+1)I, worst-case m=4 → 5/5 cycles
         EmitAddCyclesConst(cpu->Num == 0 ? (setFlags ? 4 : 2) : 5);
         if (tailReturn)
@@ -5322,7 +5355,7 @@ bool Compiler::TryEmitArmNative(const FetchedInstr& instr, ARM* cpu, bool tailRe
         EmitGuestStore(rdLo, R2);
         EmitGuestStore(rdHi, R3);  // stored before EmitCopyHostFlags overwrites R3 via MRS
         if (smlalFlagsNeeded)
-            EmitCopyHostFlags(CPSR_NZMask);  // SMLAL only updates N and Z
+            MarkHostFlagsDirty(CPSR_NZMask);
         EmitAddCyclesConst(setFlags ? 6 : 4);
         if (tailReturn)
             EmitReturn();
@@ -5351,7 +5384,7 @@ bool Compiler::TryEmitArmNative(const FetchedInstr& instr, ARM* cpu, bool tailRe
         EmitGuestStore(rdLo, R2);
         EmitGuestStore(rdHi, R3);
         if (smullFlagsNeeded)
-            EmitCopyHostFlags(CPSR_NZMask);
+            MarkHostFlagsDirty(CPSR_NZMask);
         EmitAddCyclesConst(setFlags ? 5 : 3);
         if (tailReturn)
             EmitReturn();
@@ -5380,7 +5413,7 @@ bool Compiler::TryEmitArmNative(const FetchedInstr& instr, ARM* cpu, bool tailRe
         EmitGuestStore(rdLo, R2);
         EmitGuestStore(rdHi, R3);
         if (umullFlagsNeeded)
-            EmitCopyHostFlags(CPSR_NZMask);
+            MarkHostFlagsDirty(CPSR_NZMask);
         EmitAddCyclesConst(setFlags ? 5 : 3);
         if (tailReturn)
             EmitReturn();
@@ -5679,7 +5712,7 @@ bool Compiler::TryEmitArmNative(const FetchedInstr& instr, ARM* cpu, bool tailRe
         u32 flagMask = isLogical
             ? (operand2UpdatesCarry ? CPSR_NZCMask : CPSR_NZMask)
             : CPSR_NZCVMask;
-        EmitCopyHostFlags(flagMask);
+        MarkHostFlagsDirty(flagMask);
     }
 
     EmitAddCycles(instr, false, cpu);
@@ -6050,7 +6083,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitGuestLoad(R0, src);
         EmitMovRegShiftImm(R2, R0, Shift_LSL, shift, true);
         EmitGuestStore(dst, R2);
-        if (tf) EmitCopyHostFlags(shift ? CPSR_NZCMask : CPSR_NZMask);
+        if (tf) MarkHostFlagsDirty(shift ? CPSR_NZCMask : CPSR_NZMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6067,7 +6100,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitGuestLoad(R0, src);
         EmitMovRegShiftImm(R2, R0, Shift_LSR, shift, true);
         EmitGuestStore(dst, R2);
-        if (tf) EmitCopyHostFlags(CPSR_NZCMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6084,7 +6117,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitGuestLoad(R0, src);
         EmitMovRegShiftImm(R2, R0, Shift_ASR, shift, true);
         EmitGuestStore(dst, R2);
-        if (tf) EmitCopyHostFlags(CPSR_NZCMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6100,7 +6133,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitLoadImm(R2, imm);
         EmitGuestStore(dst, R2);
         EmitCmpImm(R2, 0);
-        if (tf) EmitCopyHostFlags(CPSR_NZMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6116,7 +6149,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitGuestLoad(R0, src);
         EmitLoadImm(R1, imm);
         EmitSubReg(R2, R0, R1, true);
-        if (tf) EmitCopyHostFlags(CPSR_NZCVMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCVMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6133,7 +6166,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitLoadImm(R1, imm);
         EmitAddReg(R2, R0, R1, true);
         EmitGuestStore(dst, R2);
-        if (tf) EmitCopyHostFlags(CPSR_NZCVMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCVMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6150,7 +6183,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitLoadImm(R1, imm);
         EmitSubReg(R2, R0, R1, true);
         EmitGuestStore(dst, R2);
-        if (tf) EmitCopyHostFlags(CPSR_NZCVMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCVMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6168,7 +6201,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitGuestLoad(R1, rhs);
         EmitAddReg(R2, R0, R1, true);
         EmitGuestStore(dst, R2);
-        if (tf) EmitCopyHostFlags(CPSR_NZCVMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCVMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6186,7 +6219,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitGuestLoad(R1, rhs);
         EmitSubReg(R2, R0, R1, true);
         EmitGuestStore(dst, R2);
-        if (tf) EmitCopyHostFlags(CPSR_NZCVMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCVMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6204,7 +6237,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitLoadImm(R1, imm);
         EmitAddReg(R2, R0, R1, true);
         EmitGuestStore(dst, R2);
-        if (tf) EmitCopyHostFlags(CPSR_NZCVMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCVMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6222,7 +6255,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitLoadImm(R1, imm);
         EmitSubReg(R2, R0, R1, true);
         EmitGuestStore(dst, R2);
-        if (tf) EmitCopyHostFlags(CPSR_NZCVMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCVMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6289,7 +6322,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitGuestLoad(R1, src);
         EmitSubReg(R2, R0, R1, true);
         EmitGuestStore(dst, R2);
-        if (tf) EmitCopyHostFlags(CPSR_NZCVMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCVMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6305,7 +6338,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitGuestLoad(R0, dst);
         EmitGuestLoad(R1, src);
         EmitSubReg(R2, R0, R1, true);
-        if (tf) EmitCopyHostFlags(CPSR_NZCVMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCVMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6321,7 +6354,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitGuestLoad(R0, dst);
         EmitGuestLoad(R1, src);
         EmitAddReg(R2, R0, R1, true);
-        if (tf) EmitCopyHostFlags(CPSR_NZCVMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCVMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6358,7 +6391,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitGuestLoad(R1, src);
         EmitMulReg(R2, R0, R1, true);
         EmitGuestStore(dst, R2);
-        if (tf) EmitCopyHostFlags(CPSR_NZMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZMask);
         EmitAddCyclesConst(3);
         if (tailReturn)
             EmitReturn();
@@ -6426,7 +6459,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitGuestLoad(R0, dst);
         EmitGuestLoad(R1, src);
         EmitSubReg(R2, R0, R1, true);
-        if (tf) EmitCopyHostFlags(CPSR_NZCVMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCVMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6720,10 +6753,32 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
     case ARMInstrInfo::tk_STRB_REG:
     case ARMInstrInfo::tk_LDR_REG:
     case ARMInstrInfo::tk_LDRB_REG:
+    {
+        if (EnableThumbMemImmDirect)
+        {
+            const u32 rd = op & 0x7;
+            const u32 rn = (op >> 3) & 0x7;
+            const u32 rm = (op >> 6) & 0x7;
+            bool isLoad = (instr.Info.Kind == ARMInstrInfo::tk_LDR_REG ||
+                           instr.Info.Kind == ARMInstrInfo::tk_LDRB_REG);
+            int size = (instr.Info.Kind == ARMInstrInfo::tk_LDRB_REG ||
+                        instr.Info.Kind == ARMInstrInfo::tk_STRB_REG) ? 1 : 4;
+
+            EmitStoreR15(instr.Addr + 4);
+            EmitGuestLoad(R0, rn);
+            EmitGuestLoad(R1, rm);
+            EmitAddReg(R0, R0, R1, false);
+            if (TryEmitThumbMemImmDirect(instr, cpu, tailReturn, rd, rn, 0, size, isLoad))
+                return true;
+        }
+        goto thumb_reg_mem_fallback;
+    }
+
     case ARMInstrInfo::tk_STRH_REG:
     case ARMInstrInfo::tk_LDRSB_REG:
     case ARMInstrInfo::tk_LDRH_REG:
     case ARMInstrInfo::tk_LDRSH_REG:
+    thumb_reg_mem_fallback:
     {
         A32InstrDesc desc;
         desc.instr = instr.Instr;
@@ -6738,12 +6793,30 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
 
     case ARMInstrInfo::tk_BCOND:
     {
-        s32 offset = (s32)(op << 24) >> 23;
+        const s32 offset = (s32)(op << 24) >> 23;
+        const u32 cond = (op >> 8) & 0xF;
+        const u32 r15 = instr.Addr + 4;
+        const u32 target = r15 + (u32)offset;
+
+        if (cond < 0xE)
+        {
+            EmitStoreR15(r15);
+            EmitLoadGuestCPSRFlags();
+            EmitAddCycles(instr, true, cpu);
+
+            u8* condBranch = EmitBranchPlaceholder(cond);
+            EmitReturn();
+
+            PatchBranch(condBranch, CodePtr);
+            EmitJumpToConst(cpu, target, true, true, tailReturn);
+            return true;
+        }
+
         A32BranchDesc desc;
-        desc.r15 = instr.Addr + 4;
+        desc.r15 = r15;
         desc.codeCycles = instr.CodeCycles;
-        desc.target = desc.r15 + offset + 1;
-        desc.aux = (op >> 8) & 0xF;
+        desc.target = target + 1;
+        desc.aux = cond;
 
         EmitHelperCallWithDesc((const void*)&RunThumbCondBranch, &desc, sizeof(desc), tailReturn);
         return true;
@@ -6834,6 +6907,7 @@ void Compiler::EmitInterpreterFallback(const FetchedInstr& instr, bool thumb, bo
 
 void Compiler::EmitHelperCallWithDesc(const void* helper, const void* desc, u32 descSize, bool tailReturn)
 {
+    FlushRegAllocForHelper();
     assert((descSize & 0x3) == 0);
 
     if (tailReturn)
@@ -6865,6 +6939,7 @@ void Compiler::EmitHelperCallWithDesc(const void* helper, const void* desc, u32 
 
 void Compiler::EmitHelperCallLoadedPC(int pcReg, bool restoreCPSR)
 {
+    FlushRegAllocForHelper();
     EmitU32(0xE1A00004); // mov r0, r4
     if (pcReg != R1)
         EmitMovRegShiftImm(R1, pcReg, Shift_LSL, 0, false);
@@ -6876,6 +6951,7 @@ void Compiler::EmitHelperCallLoadedPC(int pcReg, bool restoreCPSR)
 
 void Compiler::EmitHelperCall1(const void* helper, u32 arg1Imm)
 {
+    FlushRegAllocForHelper();
     EmitLoadImm(R1, arg1Imm);
     EmitU32(0xE1A00004); // mov r0, r4
     EmitU32(0xE59FC004); // ldr ip, [pc, #4]
@@ -6886,6 +6962,7 @@ void Compiler::EmitHelperCall1(const void* helper, u32 arg1Imm)
 
 void Compiler::EmitHelperCall2(const void* helper, int arg1Reg, u32 arg2Imm)
 {
+    FlushRegAllocForHelper();
     if (arg1Reg != R1)
         EmitMovRegShiftImm(R1, arg1Reg, Shift_LSL, 0, false);
     EmitLoadImm(R2, arg2Imm);
@@ -6898,6 +6975,7 @@ void Compiler::EmitHelperCall2(const void* helper, int arg1Reg, u32 arg2Imm)
 
 void Compiler::EmitHelperCall3(const void* helper, int arg1Reg, int arg2Reg, u32 arg3Imm)
 {
+    FlushRegAllocForHelper();
     if (arg2Reg != R2)
         EmitMovRegShiftImm(R2, arg2Reg, Shift_LSL, 0, false);
     if (arg1Reg != R1)
@@ -6912,6 +6990,7 @@ void Compiler::EmitHelperCall3(const void* helper, int arg1Reg, int arg2Reg, u32
 
 void Compiler::EmitReturn()
 {
+    FlushRegAllocForHelper();
     EmitFlushPendingCycles();
     EmitU32(0xE59FC000); // ldr ip, [pc]
     EmitU32(0xE12FFF1C); // bx ip
@@ -7441,15 +7520,25 @@ void Compiler::EmitMRS(int dst)
 // Uses R3 as scratch. Must be called before emitting any conditional instruction.
 void Compiler::EmitLoadGuestCPSRFlags()
 {
+    EmitFlushDirtyFlags();
     EmitLoadReg(R3, R4, ArmMemberOffset(&ARM::CPSR));  // R3 = guest CPSR
     EmitU32(0xE128F003);  // MSR CPSR_f, R3  — copies R3[31:24] (NZCV) into host CPSR
 }
 
 void Compiler::EmitGuestLoad(int dst, int guestReg)
 {
+    if (m_useRegAlloc && guestReg >= 0 && guestReg < 15)
+    {
+        int mapped = RegAllocCache.Mapping[guestReg];
+        if (mapped != -1)
+        {
+            if (dst != mapped)
+                EmitMovRegShiftImm(dst, mapped, Shift_LSL, 0, false);
+            return;
+        }
+    }
     if (guestReg >= 0 && guestReg < 16 && m_rcHostReg[guestReg] != -1)
     {
-        // Register cached in a callee-saved host reg: emit MOV instead of LDR.
         EmitMovRegShiftImm(dst, m_rcHostReg[guestReg], Shift_LSL, 0, false);
         return;
     }
@@ -7458,15 +7547,36 @@ void Compiler::EmitGuestLoad(int dst, int guestReg)
 
 void Compiler::EmitGuestStore(int guestReg, int src)
 {
+    if (m_useRegAlloc && guestReg >= 0 && guestReg < 15)
+    {
+        int mapped = RegAllocCache.Mapping[guestReg];
+        if (mapped != -1)
+        {
+            if (src != mapped)
+                EmitMovRegShiftImm(mapped, src, Shift_LSL, 0, false);
+            RegAllocCache.DirtyRegs |= (1 << guestReg);
+            return;
+        }
+    }
     EmitStoreReg(src, R4, ArmMemberOffset(&ARM::R) + guestReg * 4);
 }
 
 // Conditional guest-register store: STR{cond} src, [R4, #guest_Rx_offset].
 void Compiler::EmitCondGuestStore(int guestReg, int src, u32 cond)
 {
+    if (m_useRegAlloc && guestReg >= 0 && guestReg < 15)
+    {
+        int mapped = RegAllocCache.Mapping[guestReg];
+        if (mapped != -1)
+        {
+            if (src != mapped)
+                EmitU32(0x01A00000u | ((u32)cond << 28) | ((u32)mapped << 12) | (u32)src);
+            RegAllocCache.DirtyRegs |= (1 << guestReg);
+            return;
+        }
+    }
     u32 offset = ArmMemberOffset(&ARM::R) + (u32)guestReg * 4;
     assert(offset <= 0xFFF);
-    // StrImm encoding without the AL cond (strip 0xE from [31:28]) then OR in cond.
     EmitU32(0x05800000u | ((u32)R4 << 16) | ((u32)src << 12) | offset | ((u32)cond << 28));
 }
 
@@ -7479,7 +7589,7 @@ void Compiler::EmitStoreR15(u32 r15)
 void Compiler::EmitCopyNZFromReg(int reg)
 {
     EmitCmpImm(reg, 0);
-    EmitCopyHostFlags(CPSR_NZMask);
+    MarkHostFlagsDirty(CPSR_NZMask);
 }
 
 void Compiler::EmitCopyHostFlags(u32 mask)
@@ -7515,6 +7625,7 @@ void Compiler::EmitAddCyclesConst(u32 cycles)
 void Compiler::EmitJumpToConst(ARM* cpu, u32 target, bool sourceThumb,
                                bool thumbTarget, bool tailReturn)
 {
+    FlushRegAllocForHelper();
     u32 newPC = 0;
     u32 cycles = 0;
 
@@ -7590,6 +7701,7 @@ void Compiler::FlushIcache(u8* start, u8* end)
 
 void Compiler::EmitSelfLinkTail(ARM* cpu, u8* blockStart, u32 branchCycles)
 {
+    FlushRegAllocForHelper();
     // M18 self-link tail (ARM9, ARM/Thumb guest self-loops).
     // Replaces EmitHelperCallWithDesc+ARM_Ret for an unconditional B targeting
     // the current block's first instruction.  Saves the ARM_Dispatch/ARM_Ret

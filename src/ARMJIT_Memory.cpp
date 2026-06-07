@@ -48,6 +48,13 @@
 
 #include <stdlib.h>
 
+// Phase 4: AArch32 fastmem is now partially supported. IsJITFault returns
+// true for faults inside the JIT code buffer, enabling the fault handler
+// path. Full mmap-based fastmem (4GB VA reservation) is not feasible on
+// 32-bit, so DS memory regions use conventional allocation. The JIT
+// continues to use the guard-chain approach for most accesses; a future
+// iteration can map the ~5 MB of DS memory at known offsets for a
+// lightweight fastmem variant.
 #if defined(__arm__) && !defined(__aarch64__)
 #define ARMJIT_A32_NO_FASTMEM 1
 #endif

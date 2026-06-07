@@ -21,6 +21,7 @@
 
 #include "../ARMJIT.h"
 #include "../ARMJIT_Internal.h"
+#include "../ARMJIT_RegisterCache.h"
 
 namespace ARMJIT
 {
@@ -66,6 +67,20 @@ private:
     // ── Block-local register cache (R5–R10) ───────────────────────────────────
     // For pure-source ARM guest registers, maps guest reg index → host reg or -1.
     int8_t m_rcHostReg[16];
+
+    // ── Full register allocator (R5–R11) ─────────────────────────────────────
+    RegisterCache<Compiler, int> RegAllocCache;
+    bool m_useRegAlloc = false;
+
+    void LoadReg(int reg, int nativeReg);
+    void SaveReg(int reg, int nativeReg);
+    void FlushRegAllocForHelper();
+
+    // ── Lazy flag evaluation state ───────────────────────────────────────────
+    bool m_hostFlagsDirty = false;
+    u32  m_dirtyFlagsMask = 0;
+    void MarkHostFlagsDirty(u32 mask);
+    void EmitFlushDirtyFlags();
 
     // ── Cycle batching accumulator ────────────────────────────────────────────
     int m_pendingCycles;
