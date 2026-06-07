@@ -24,7 +24,7 @@ include $(CLEAR_VARS)
 LOCAL_MODULE    := retro
 LOCAL_SRC_FILES := $(SOURCES_C) $(SOURCES_CXX) $(SOURCES_S)
 LOCAL_CFLAGS    := $(CORE_FLAGS)
-LOCAL_CPPFLAGS  := -std=c++17 -fexceptions $(CORE_FLAGS)
+LOCAL_CPPFLAGS  := -std=c++17 -fexceptions -Wno-invalid-offsetof -Wno-macro-redefined $(CORE_FLAGS)
 LOCAL_LDFLAGS   := -Wl,-version-script=$(CORE_DIR)/link.T
 
 # ── YAGE: GLES3 / Android OpenGL ─────────────────────────────────────────

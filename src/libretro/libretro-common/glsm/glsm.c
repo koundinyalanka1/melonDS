@@ -2629,7 +2629,9 @@ void rglDrawBuffer(GLenum buf)
 #ifdef GLSM_DEBUG
    log_cb(RETRO_LOG_INFO, "glDrawBuffer.\n");
 #endif
-#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES3)
+#if defined(HAVE_OPENGLES3)
+   glDrawBuffers(1, &buf);
+#elif defined(HAVE_OPENGL)
    glDrawBuffer(buf);
 #endif
 }

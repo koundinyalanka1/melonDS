@@ -583,9 +583,14 @@ struct retro_core_option_v2_definition option_defs_us[] = {
          { "30", NULL },
          { "31", NULL },
          { "32", NULL },
+         { "33", NULL },
+         { "48", NULL },
+         { "64", NULL },
+         { "96", NULL },
+         { "128", NULL },
          { NULL, NULL },
       },
-      "32"
+      "128"
    },
    {
       "melonds_jit_branch_optimisations",

@@ -110,8 +110,6 @@ static void context_reset(void)
       return;
    }
 
-   if(using_opengl)
-      GPU::InitRenderer(true);
    glsm_ctl(GLSM_CTL_STATE_UNBIND, NULL);
 
    initialized_glsm = true;
@@ -418,7 +416,7 @@ static bool render_gl2d_output(void)
    return true;
 }
 
-static void prepare_gl2d_present_state(void)
+static void prepare_default_present_state(void)
 {
    glDisable(GL_DEPTH_TEST);
    glDisable(GL_STENCIL_TEST);
@@ -428,6 +426,15 @@ static void prepare_gl2d_present_state(void)
    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
    glDepthMask(GL_TRUE);
    glStencilMask(0xFF);
+
+#if defined(HAVE_OPENGLES3)
+   glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+   const GLenum back = GL_BACK;
+   glDrawBuffers(1, &back);
+#elif defined(HAVE_OPENGL)
+   glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+   glDrawBuffer(GL_BACK);
+#endif
 }
 
 void render_opengl_frame(bool sw)
@@ -440,12 +447,39 @@ void render_opengl_frame(bool sw)
    bool virtual_cursor = cursor_enabled(&input_state);
 
    glBindFramebuffer(GL_FRAMEBUFFER, glsm_get_current_framebuffer()); CHECK_GL("glBindFramebuffer");
+   prepare_default_present_state(); CHECK_GL("prepare_default_present_state");
 
-   if(refresh_opengl)
+   static unsigned last_buffer_width = 0;
+   static unsigned last_buffer_height = 0;
+   static unsigned last_screen_width = 0;
+   static unsigned last_screen_height = 0;
+   static unsigned last_screen_gap = 0;
+   static unsigned last_hybrid_ratio = 0;
+   static ScreenLayout last_layout = ScreenLayout::TopBottom;
+   static SmallScreenLayout last_small_screen = SmallScreenLayout::SmallScreenTop;
+
+   bool layout_dirty =
+      refresh_opengl ||
+      last_buffer_width != screen_layout_data.buffer_width ||
+      last_buffer_height != screen_layout_data.buffer_height ||
+      last_screen_width != screen_layout_data.screen_width ||
+      last_screen_height != screen_layout_data.screen_height ||
+      last_screen_gap != screen_layout_data.screen_gap ||
+      last_hybrid_ratio != screen_layout_data.hybrid_ratio ||
+      last_layout != screen_layout_data.displayed_layout ||
+      last_small_screen != screen_layout_data.hybrid_small_screen;
+
+   if(layout_dirty)
    {
-      glClearColor(0,0,0,0);
-      glClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT );
       setup_opengl_frame_state();
+      last_buffer_width = screen_layout_data.buffer_width;
+      last_buffer_height = screen_layout_data.buffer_height;
+      last_screen_width = screen_layout_data.screen_width;
+      last_screen_height = screen_layout_data.screen_height;
+      last_screen_gap = screen_layout_data.screen_gap;
+      last_hybrid_ratio = screen_layout_data.hybrid_ratio;
+      last_layout = screen_layout_data.displayed_layout;
+      last_small_screen = screen_layout_data.hybrid_small_screen;
    }
 
    if(virtual_cursor)
@@ -468,12 +502,13 @@ void render_opengl_frame(bool sw)
    glDisable(GL_BLEND);
 
    glViewport(0, 0, screen_layout_data.buffer_width, screen_layout_data.buffer_height); CHECK_GL("glViewport");
+   glClearColor(0, 0, 0, 1);
+   glClear(GL_COLOR_BUFFER_BIT); CHECK_GL("glClear(default framebuffer)");
 
    glActiveTexture(GL_TEXTURE0);
 
    if (gl2d_active)
    {
-      prepare_gl2d_present_state();
       if (!render_gl2d_output())
       {
          if (!gl2d_active)

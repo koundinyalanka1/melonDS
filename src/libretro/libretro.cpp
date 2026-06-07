@@ -532,6 +532,12 @@ static void check_variables(bool init)
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
       Config::JIT_MaxBlockSize = std::stoi(var.value);
+#if defined(__arm__) && !defined(__aarch64__)
+      // AArch32 JIT: enforce minimum 128-instr blocks regardless of stored option
+      // value. TV devices may have cached "32" from older builds. The A32 compiler
+      // uses std::vector-backed block arrays so any size up to 128 is safe.
+      if (Config::JIT_MaxBlockSize < 128) Config::JIT_MaxBlockSize = 128;
+#endif
    }
 
    var.key = "melonds_jit_branch_optimisations";

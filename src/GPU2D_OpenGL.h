@@ -51,6 +51,15 @@ public:
 
     void BindOutputTexture(int unit);
     void BindOutputTextureForScreen(int screen);
+    // M27: execute any deferred RenderFrame(s) queued by DrawScanline(191).
+    // Called from the libretro GL present thread so the compositor runs with
+    // the GL context current on that thread.
+    void RenderPending();
+
+    // Size the (upscaled) OBJ render target + compositor output textures to
+    // `scale`×. Called by GPU::SetRenderSettings when the GL scale option
+    // changes so OutputTex stays in sync with the GPU3D framebuffer size.
+    void SetScaleFactor(int scale);
 
 private:
     // ── GL setup (C2.1) ───────────────────────────────────────────────────
@@ -115,10 +124,6 @@ private:
     // GPU3D output (Output3DTex) as BG0 when the 3D layer is enabled. This is
     // where the GPU 2D pipeline produces visible pixels — driven at C4.2.
     void RenderScreen(int ystart, int yend, Unit* unit);
-
-    // Size the (upscaled) OBJ render target + compositor output to `scale`×.
-    // Wired to melonds_opengl_resolution at C5; C3.1 allocates at 1×.
-    void SetScaleFactor(int scale);
 
     // ── Frame driver (C4.2) ───────────────────────────────────────────────
     // Run the whole GPU 2D pipeline for `unit` for the frame whose per-scanline
@@ -300,7 +305,7 @@ private:
     GLuint CompositorConfigUBO[2] = {0, 0};
     GLuint OutputTex[2] = {0, 0};   // final composited screen (RGBA8, scaled)
     GLuint OutputFB[2]  = {0, 0};
-    int    OutputScreenUnit[2] = {1, 0};
+    int    OutputScreenUnit[2] = {0, 1};
     // first scanline not yet composited this frame (per unit).
     int    LastLine[2]  = {0, 0};
 
@@ -318,10 +323,14 @@ private:
     // are always invalidated on Init to force the first frame to upload.
     static constexpr int kBGPalEntries  = 256 * (1 + 4 * 16); // std + 4×16 ext-pal rows
     static constexpr int kOBJPalEntries = 256 * (1 + 16);     // std + 16 ext-pal rows
+    static constexpr int kOBJVRAMBytes  = 256 * 1024;         // engine A max OBJ VRAM
     u16 PrevPalBG[2][kBGPalEntries]   = {};
     u16 PrevPalOBJ[2][kOBJPalEntries] = {};
     bool PalBGValid[2]  = {false, false};
     bool PalOBJValid[2] = {false, false};
+    u8   PrevOBJVRAM[2][kOBJVRAMBytes] = {};
+    u32  PrevOBJVRAMBytes[2]           = {0, 0};
+    bool OBJVRAMValid[2]               = {false, false};
 
     // C1/C2 passthrough backend (correctness fallback until C4 closes the loop).
     SoftRenderer Soft;

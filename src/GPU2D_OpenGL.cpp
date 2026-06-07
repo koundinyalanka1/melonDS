@@ -19,6 +19,9 @@
 
 #include <cstring>   // memcpy / memset
 #include <cstddef>   // offsetof
+#include <cstdio>    // fopen / fwrite / fread / fclose / remove
+#include <cstdlib>   // malloc / free
+#include <time.h>    // clock_gettime (A32JIT_PROFILE GL2D phase timing)
 
 #ifndef YAGE_MELONDS_GL_DIAG
 #define YAGE_MELONDS_GL_DIAG 0
@@ -31,6 +34,11 @@
 #include <cstdio>
 #define MELONDS_2D_LOG(...) do { fprintf(stderr, "melonDS-GLES: " __VA_ARGS__); fprintf(stderr, "\n"); } while (0)
 #endif
+
+// System directory set by libretro.cpp (GET_SYSTEM_DIRECTORY callback).
+// Declared in global scope so GPU2D_TryLoadBinaries / GPU2D_SaveBinaries can
+// access it without namespace qualification.
+extern char retro_base_directory[4096];
 
 namespace GPU2D
 {
@@ -68,6 +76,52 @@ static void texParamsDefault(GLenum target)
     glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 }
 
+// ── M20: GL 2D renderer CPU-phase profiling ──────────────────────────────────
+// retro_run wall-time ≈ NDS::RunFrame, with no GPU wait, so the A53 CPU — not the
+// Mali GPU — gates the frame. This times the CPU command-submission cost of each
+// GLRenderer2D::RenderFrame phase (BG prerender, sprite work, final composite) so
+// the next TV run shows whether GL2D submission is a meaningful slice of the
+// renderer budget vs the GPU3D geometry engine. Wall-clock around GL calls also
+// captures any implicit driver sync/stall a phase triggers. Profiling-build only.
+#if A32JIT_PROFILE
+static inline u64 GL2DProfileNowNS()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000000000ULL + (u64)ts.tv_nsec;
+}
+static struct {
+    u64 TotalNS, BGNS, SpriteNS, CompositeNS;
+    // BG sub-phases (inside BGNS): config derive, VRAM upload, palette, layer draws.
+    u64 BGConfigNS, BGVRAMNS, BGPalNS, BGDrawNS;
+    u32 Calls;
+} GL2DProfile = {};
+static void GL2DProfileMaybeLog()
+{
+    // RenderFrame is called once per unit (2 units/frame) → log every 600 calls
+    // (~300 frames), matching the GPU3D / RunFrame profile cadence.
+    if (GL2DProfile.Calls < 600) return;
+    const double calls = (double)GL2DProfile.Calls;
+    MELONDS_2D_LOG("GPU2D GL profile: calls=%u total=%.3fms bg=%.3fms obj=%.3fms composite=%.3fms (per RenderFrame; CPU submit)",
+                   GL2DProfile.Calls,
+                   (double)GL2DProfile.TotalNS / calls / 1e6,
+                   (double)GL2DProfile.BGNS / calls / 1e6,
+                   (double)GL2DProfile.SpriteNS / calls / 1e6,
+                   (double)GL2DProfile.CompositeNS / calls / 1e6);
+    MELONDS_2D_LOG("GPU2D GL bg-phases: config=%.3fms vram=%.3fms pal=%.3fms draw=%.3fms (per RenderFrame; vram+draw dirty-gated/cached)",
+                   (double)GL2DProfile.BGConfigNS / calls / 1e6,
+                   (double)GL2DProfile.BGVRAMNS / calls / 1e6,
+                   (double)GL2DProfile.BGPalNS / calls / 1e6,
+                   (double)GL2DProfile.BGDrawNS / calls / 1e6);
+    GL2DProfile = {};
+}
+#define GL2D_PROF_NOW()      GL2DProfileNowNS()
+#define GL2D_PROF_ADD(f, t0) do { GL2DProfile.f += GL2DProfileNowNS() - (t0); } while (0)
+#else
+#define GL2D_PROF_NOW()      (0ULL)
+#define GL2D_PROF_ADD(f, t0) do { (void)(t0); } while (0)
+#endif
+
 GLRenderer2D::GLRenderer2D()
 {
 }
@@ -76,6 +130,8 @@ GLRenderer2D::~GLRenderer2D()
 {
     DeInitGL();
 }
+
+static void ResetBGCaches();   // BG upload/prerender cache reset (defined below)
 
 bool GLRenderer2D::Init()
 {
@@ -92,72 +148,193 @@ bool GLRenderer2D::Init()
         return false;
     }
     GLReady = true;
+    // Fresh BG textures/FBOs were just created — drop any stale upload/prerender
+    // cache state from a previous renderer instance.
+    ResetBGCaches();
     MELONDS_2D_LOG("GPU2D: GL 2D renderer ACTIVE (C5: BG + OBJ + compositor "
                    "drive frames; OutputTex is presented directly; "
                    "3D-layer hook active; upscaling pending)");
     return true;
 }
 
+// ── Shader binary cache helpers ──────────────────────────────────────────────
+// On Android (GLES3 core), glGetProgramBinary / glProgramBinary let us persist
+// compiled shader programs across sessions.  The cache key combines a djb2 hash
+// of all 8 shader sources (invalidated when any GLSL changes) with a hash of the
+// GL vendor/renderer/version string (invalidated on driver update).
+// First run: compiles GLSL normally (~2 s on Mali-G51) then writes the cache.
+// Subsequent runs: loads from cache in ~50 ms, skipping GLSL compilation.
+
+static const u32 kGPU2DCacheMagic = 0x47324443u; // "G2DC"
+
+static u32 gpu2d_djb2(const char* s, u32 h = 5381u)
+{
+    for (; *s; ++s) h = ((h << 5) + h) ^ (u8)*s;
+    return h;
+}
+
+static u32 gpu2d_src_hash()
+{
+    u32 h = 5381u;
+    h = gpu2d_djb2(k2DLayerPreVS,   h); h = gpu2d_djb2(k2DLayerPreFS,   h);
+    h = gpu2d_djb2(k2DSpritePreVS,  h); h = gpu2d_djb2(k2DSpritePreFS,  h);
+    h = gpu2d_djb2(k2DSpriteVS,     h); h = gpu2d_djb2(k2DSpriteFS,     h);
+    h = gpu2d_djb2(k2DCompositorVS, h); h = gpu2d_djb2(k2DCompositorFS, h);
+    return h;
+}
+
+static u32 gpu2d_gpu_hash()
+{
+    u32 h = 5381u;
+    const char* s;
+    s = (const char*)glGetString(GL_VENDOR);   if (s) h = gpu2d_djb2(s, h);
+    s = (const char*)glGetString(GL_RENDERER); if (s) h = gpu2d_djb2(s, h);
+    s = (const char*)glGetString(GL_VERSION);  if (s) h = gpu2d_djb2(s, h);
+    return h;
+}
+
+// Load all 4 compiled program binaries from cache.  Fills out[4] with program
+// IDs.  Returns true only if ALL 4 programs pass GL_LINK_STATUS.
+// On any failure (magic mismatch, read error, driver rejects binary), deletes
+// the stale cache file and returns false so the caller falls back to GLSL.
+static bool GPU2D_TryLoadBinaries(const char* path, GLuint out[4])
+{
+    for (int i = 0; i < 4; i++) out[i] = 0;
+    GLint nfmt = 0;
+    glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS, &nfmt);
+    if (nfmt == 0) return false;
+
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+
+    bool ok = false;
+    do {
+        u32 magic, src_h, gpu_h;
+        if (fread(&magic, 4, 1, f) != 1 || magic  != kGPU2DCacheMagic)   break;
+        if (fread(&src_h, 4, 1, f) != 1 || src_h  != gpu2d_src_hash())   break;
+        if (fread(&gpu_h, 4, 1, f) != 1 || gpu_h  != gpu2d_gpu_hash())   break;
+        ok = true;
+        for (int i = 0; i < 4 && ok; i++) {
+            u32 fmt32 = 0, len32 = 0;
+            if (fread(&fmt32, 4, 1, f) != 1) { ok = false; break; }
+            if (fread(&len32, 4, 1, f) != 1 || len32 == 0 || len32 > 64u*1024*1024)
+                { ok = false; break; }
+            void* data = malloc((size_t)len32);
+            if (!data) { ok = false; break; }
+            if (fread(data, 1, len32, f) != (size_t)len32) { free(data); ok = false; break; }
+            out[i] = glCreateProgram();
+            glProgramBinary(out[i], (GLenum)fmt32, data, (GLsizei)len32);
+            free(data);
+            GLint status = 0;
+            glGetProgramiv(out[i], GL_LINK_STATUS, &status);
+            if (!status) ok = false;
+        }
+    } while (0);
+
+    fclose(f);
+    if (!ok) {
+        for (int i = 0; i < 4; i++) { if (out[i]) { glDeleteProgram(out[i]); out[i] = 0; } }
+        remove(path);
+    }
+    return ok;
+}
+
+// Save the 4 linked programs to the binary cache.  Silent on any I/O or GL error.
+static void GPU2D_SaveBinaries(const char* path, const GLuint progs[4])
+{
+    GLint nfmt = 0;
+    glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS, &nfmt);
+    if (nfmt == 0) return;
+
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+
+    u32 magic = kGPU2DCacheMagic, src_h = gpu2d_src_hash(), gpu_h = gpu2d_gpu_hash();
+    fwrite(&magic, 4, 1, f); fwrite(&src_h, 4, 1, f); fwrite(&gpu_h, 4, 1, f);
+
+    for (int i = 0; i < 4; i++) {
+        GLint len = 0;
+        glGetProgramiv(progs[i], GL_PROGRAM_BINARY_LENGTH, &len);
+        if (len <= 0) { fclose(f); remove(path); return; }
+        void* data = malloc((size_t)len);
+        if (!data) { fclose(f); remove(path); return; }
+        GLenum fmt = 0; GLsizei actual = 0;
+        glGetProgramBinary(progs[i], len, &actual, &fmt, data);
+        u32 fmt32 = (u32)fmt, len32 = (u32)actual;
+        fwrite(&fmt32, 4, 1, f); fwrite(&len32, 4, 1, f); fwrite(data, 1, (size_t)actual, f);
+        free(data);
+    }
+    fclose(f);
+    MELONDS_2D_LOG("GPU2D: shader binary cache saved (%s)", path);
+}
+
 bool GLRenderer2D::InitShaders()
 {
-    // Compile + link the background layer pre-pass program. This is the first
-    // on-device validation of the GLES3-ported LayerPre shaders (C2.0).
-    if (!OpenGL::BuildShaderProgram(k2DLayerPreVS, k2DLayerPreFS, LayerPreShader, "2DLayerPreShader"))
-        return false;
+    // ── Shader binary cache: skip ~2 s GLSL compilation on warm starts ───────
+    char cache_path[4096] = {};
+    if (retro_base_directory[0])
+        snprintf(cache_path, sizeof(cache_path), "%s/gpu2d_shaders.cache", retro_base_directory);
 
-    glBindAttribLocation(LayerPreShader[2], 0, "vPosition");
-    glBindFragDataLocation(LayerPreShader[2], 0, "oColor");
+    GLuint cached[4] = {0, 0, 0, 0};
+    bool from_cache = cache_path[0] && GPU2D_TryLoadBinaries(cache_path, cached);
 
-    if (!OpenGL::LinkShaderProgram(LayerPreShader))
-        return false;
+    if (from_cache) {
+        MELONDS_2D_LOG("GPU2D: shader binary cache HIT — GLSL compilation skipped");
+        LayerPreShader[2]   = cached[0]; LayerPreShader[0]   = LayerPreShader[1]   = 0;
+        SpritePreShader[2]  = cached[1]; SpritePreShader[0]  = SpritePreShader[1]  = 0;
+        SpriteShader[2]     = cached[2]; SpriteShader[0]     = SpriteShader[1]     = 0;
+        CompositorShader[2] = cached[3]; CompositorShader[0] = CompositorShader[1] = 0;
+    } else {
+        // ── Full GLSL compilation (first run / cache invalidated) ─────────────
+        if (!OpenGL::BuildShaderProgram(k2DLayerPreVS, k2DLayerPreFS, LayerPreShader, "2DLayerPreShader"))
+            return false;
+        glProgramParameteri(LayerPreShader[2], GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
+        glBindAttribLocation(LayerPreShader[2], 0, "vPosition");
+        glBindFragDataLocation(LayerPreShader[2], 0, "oColor");
+        if (!OpenGL::LinkShaderProgram(LayerPreShader)) return false;
+
+        if (!OpenGL::BuildShaderProgram(k2DSpritePreVS, k2DSpritePreFS, SpritePreShader, "2DSpritePreShader"))
+            return false;
+        glProgramParameteri(SpritePreShader[2], GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
+        glBindAttribLocation(SpritePreShader[2], 0, "vPosition");
+        glBindAttribLocation(SpritePreShader[2], 1, "vSpriteIndex");
+        glBindFragDataLocation(SpritePreShader[2], 0, "oColor");
+        if (!OpenGL::LinkShaderProgram(SpritePreShader)) return false;
+
+        if (!OpenGL::BuildShaderProgram(k2DSpriteVS, k2DSpriteFS, SpriteShader, "2DSpriteShader"))
+            return false;
+        glProgramParameteri(SpriteShader[2], GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
+        glBindAttribLocation(SpriteShader[2], 0, "vPosition");
+        glBindAttribLocation(SpriteShader[2], 1, "vTexcoord");
+        glBindAttribLocation(SpriteShader[2], 2, "vSpriteIndex");
+        glBindFragDataLocation(SpriteShader[2], 0, "oColor");
+        glBindFragDataLocation(SpriteShader[2], 1, "oFlags");
+        if (!OpenGL::LinkShaderProgram(SpriteShader)) return false;
+
+        if (!OpenGL::BuildShaderProgram(k2DCompositorVS, k2DCompositorFS, CompositorShader, "2DCompositorShader"))
+            return false;
+        glProgramParameteri(CompositorShader[2], GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
+        glBindAttribLocation(CompositorShader[2], 0, "vPosition");
+        glBindFragDataLocation(CompositorShader[2], 0, "oColor");
+        if (!OpenGL::LinkShaderProgram(CompositorShader)) return false;
+    }
+
+    // ── Uniform / UBO setup — identical for cache-hit and compile paths ───────
+    GLint loc;
+    GLuint blk;
 
     glUseProgram(LayerPreShader[2]);
-
-    GLint loc;
-    loc = glGetUniformLocation(LayerPreShader[2], "VRAMTex");
-    if (loc >= 0) glUniform1i(loc, 0);
-    loc = glGetUniformLocation(LayerPreShader[2], "PalTex");
-    if (loc >= 0) glUniform1i(loc, 1);
-
-    GLuint blk = glGetUniformBlockIndex(LayerPreShader[2], "ubBGConfig");
-    if (blk != GL_INVALID_INDEX)
-        glUniformBlockBinding(LayerPreShader[2], blk, 20);
-
+    loc = glGetUniformLocation(LayerPreShader[2], "VRAMTex"); if (loc >= 0) glUniform1i(loc, 0);
+    loc = glGetUniformLocation(LayerPreShader[2], "PalTex");  if (loc >= 0) glUniform1i(loc, 1);
+    blk = glGetUniformBlockIndex(LayerPreShader[2], "ubBGConfig");
+    if (blk != GL_INVALID_INDEX) glUniformBlockBinding(LayerPreShader[2], blk, 20);
     LayerPreCurBGULoc = glGetUniformLocation(LayerPreShader[2], "uCurBG");
-
-    // ── Sprite pre-pass program (OBJ → 1024×512 atlas) ─────────────────────
-    // Integer vertex attribs (glVertexAttribIPointer): vPosition (ivec2 quad
-    // corner) at 0, vSpriteIndex (int) at 1; single colour output at 0.
-    if (!OpenGL::BuildShaderProgram(k2DSpritePreVS, k2DSpritePreFS, SpritePreShader, "2DSpritePreShader"))
-        return false;
-
-    glBindAttribLocation(SpritePreShader[2], 0, "vPosition");
-    glBindAttribLocation(SpritePreShader[2], 1, "vSpriteIndex");
-    glBindFragDataLocation(SpritePreShader[2], 0, "oColor");
-
-    if (!OpenGL::LinkShaderProgram(SpritePreShader))
-        return false;
 
     glUseProgram(SpritePreShader[2]);
     loc = glGetUniformLocation(SpritePreShader[2], "VRAMTex"); if (loc >= 0) glUniform1i(loc, 0);
     loc = glGetUniformLocation(SpritePreShader[2], "PalTex");  if (loc >= 0) glUniform1i(loc, 1);
     blk = glGetUniformBlockIndex(SpritePreShader[2], "ubSpriteConfig");
     if (blk != GL_INVALID_INDEX) glUniformBlockBinding(SpritePreShader[2], blk, 21);
-
-    // ── Sprite composite program (atlas → OBJ layer, MRT colour+flags) ─────
-    // vPosition at 0, vTexcoord at 1, vSpriteIndex at 2; outputs oColor@0,
-    // oFlags@1 (pinned via layout() in the FS; the bind calls are no-ops).
-    if (!OpenGL::BuildShaderProgram(k2DSpriteVS, k2DSpriteFS, SpriteShader, "2DSpriteShader"))
-        return false;
-
-    glBindAttribLocation(SpriteShader[2], 0, "vPosition");
-    glBindAttribLocation(SpriteShader[2], 1, "vTexcoord");
-    glBindAttribLocation(SpriteShader[2], 2, "vSpriteIndex");
-    glBindFragDataLocation(SpriteShader[2], 0, "oColor");
-    glBindFragDataLocation(SpriteShader[2], 1, "oFlags");
-
-    if (!OpenGL::LinkShaderProgram(SpriteShader))
-        return false;
 
     glUseProgram(SpriteShader[2]);
     loc = glGetUniformLocation(SpriteShader[2], "SpriteTex");     if (loc >= 0) glUniform1i(loc, 0);
@@ -169,9 +346,7 @@ bool GLRenderer2D::InitShaders()
     if (blk != GL_INVALID_INDEX) glUniformBlockBinding(SpriteShader[2], blk, 24);
     SpriteRenderTransULoc = glGetUniformLocation(SpriteShader[2], "uRenderTransparent");
 
-    // ── Mosaic lookup texture (16 mosaic sizes × 256 x-positions, R8I) ─────
-    // mosaic_tex[m][x] = the x-coord the pixel at x snaps to under mosaic m
-    // (the compositor / sprite path use it for horizontal mosaic).
+    // ── Mosaic lookup texture (16 mosaic sizes × 256 x-positions, R8I) ───────
     {
         u8* mosaic_tex = new u8[256 * 16];
         for (int m = 0; m < 16; m++)
@@ -191,16 +366,6 @@ bool GLRenderer2D::InitShaders()
         delete[] mosaic_tex;
     }
 
-    // ── Compositor program (BG+OBJ → OutputTex) ────────────────────────────
-    if (!OpenGL::BuildShaderProgram(k2DCompositorVS, k2DCompositorFS, CompositorShader, "2DCompositorShader"))
-        return false;
-
-    glBindAttribLocation(CompositorShader[2], 0, "vPosition");
-    glBindFragDataLocation(CompositorShader[2], 0, "oColor");
-
-    if (!OpenGL::LinkShaderProgram(CompositorShader))
-        return false;
-
     glUseProgram(CompositorShader[2]);
     loc = glGetUniformLocation(CompositorShader[2], "BGLayerTex[0]"); if (loc >= 0) glUniform1i(loc, 0);
     loc = glGetUniformLocation(CompositorShader[2], "BGLayerTex[1]"); if (loc >= 0) glUniform1i(loc, 1);
@@ -210,15 +375,19 @@ bool GLRenderer2D::InitShaders()
     loc = glGetUniformLocation(CompositorShader[2], "Capture128Tex"); if (loc >= 0) glUniform1i(loc, 5);
     loc = glGetUniformLocation(CompositorShader[2], "Capture256Tex"); if (loc >= 0) glUniform1i(loc, 6);
     loc = glGetUniformLocation(CompositorShader[2], "MosaicTex");     if (loc >= 0) glUniform1i(loc, 7);
-
     blk = glGetUniformBlockIndex(CompositorShader[2], "ubBGConfig");
     if (blk != GL_INVALID_INDEX) glUniformBlockBinding(CompositorShader[2], blk, 20);
     blk = glGetUniformBlockIndex(CompositorShader[2], "ubScanlineConfig");
     if (blk != GL_INVALID_INDEX) glUniformBlockBinding(CompositorShader[2], blk, 22);
     blk = glGetUniformBlockIndex(CompositorShader[2], "ubCompositorConfig");
     if (blk != GL_INVALID_INDEX) glUniformBlockBinding(CompositorShader[2], blk, 23);
-
     CompositorScaleULoc = glGetUniformLocation(CompositorShader[2], "uScaleFactor");
+
+    // ── Save compiled programs to binary cache (compile path only) ────────────
+    if (!from_cache && cache_path[0]) {
+        GLuint progs[4] = { LayerPreShader[2], SpritePreShader[2], SpriteShader[2], CompositorShader[2] };
+        GPU2D_SaveBinaries(cache_path, progs);
+    }
 
     return true;
 }
@@ -534,6 +703,11 @@ void GLRenderer2D::DeInitGL()
         if (OutputTex[u])              { glDeleteTextures(1, &OutputTex[u]);              OutputTex[u] = 0; }
         if (OutputFB[u])               { glDeleteFramebuffers(1, &OutputFB[u]);           OutputFB[u] = 0; }
         if (CompositorConfigUBO[u])    { glDeleteBuffers(1, &CompositorConfigUBO[u]);     CompositorConfigUBO[u] = 0; }
+
+        PalBGValid[u] = false;
+        PalOBJValid[u] = false;
+        OBJVRAMValid[u] = false;
+        PrevOBJVRAMBytes[u] = 0;
     }
     GLReady = false;
     GPU::GL2DActive = false;
@@ -974,25 +1148,68 @@ void GLRenderer2D::UpdateLayerConfig(Unit* unit)
 // Upload one [start, start+size) VRAM byte range into the bound R8UI texture.
 // VRAM is laid out 1024 bytes/row, so a byte range maps to whole texture rows.
 // start == 0xFFFFFFFF marks "no range" (e.g. bitmap layers have no tile range).
-static void uploadVRAMRange(const u8* vram, u32 start, u32 size, int bgheight)
+// Returns true iff a glTexSubImage2D upload actually happened (false when the
+// range is empty or the gated memcmp proved the rows unchanged). The caller uses
+// this to drive the BG-layer prerender cache.
+static bool uploadVRAMRange(const u8* vram, u8* cache, bool gate,
+                            u32 start, u32 size, int bgheight)
 {
-    if (start == 0xFFFFFFFF || size == 0) return;
+    if (start == 0xFFFFFFFF || size == 0) return false;
 
     u32 limit = (u32)bgheight * 1024;
-    if (start >= limit) return;
+    if (start >= limit) return false;
     u32 end = start + size;
     if (end > limit) end = limit;
 
     int startRow = (int)(start >> 10);
     int endRow   = (int)((end + 1023) >> 10);
     if (endRow > bgheight) endRow = bgheight;
-    if (endRow <= startRow) return;
+    if (endRow <= startRow) return false;
+
+    // FPS: skip re-uploading BG tile/map rows whose bytes are unchanged since the
+    // last upload. `cache` mirrors VRAMTex_BG — every upload writes the same flat
+    // VRAM bytes to both texture and cache — so a memcmp match means the texture
+    // already holds this data. Static BGs (NSMB tiles/maps) then cost a memcmp
+    // instead of a full glTexSubImage2D driver copy + GPU texture update.
+    const size_t off = (size_t)startRow * 1024;
+    const size_t len = (size_t)(endRow - startRow) * 1024;
+    if (cache)
+    {
+        if (gate && memcmp(&vram[off], &cache[off], len) == 0)
+            return false;
+        memcpy(&cache[off], &vram[off], len);
+    }
 
     glTexSubImage2D(GL_TEXTURE_2D, 0,
                     0, startRow,
                     1024, endRow - startRow,
                     GL_RED_INTEGER, GL_UNSIGNED_BYTE,
-                    &vram[(size_t)startRow * 1024]);
+                    &vram[off]);
+    return true;
+}
+
+// BG-layer prerender cache signals. PrerenderLayer's output for a layer depends
+// only on BG VRAM (tiles/map), the BG palette, and that layer's config — so when
+// none changed, last frame's prerendered BGLayer texture is still valid and the
+// FBO-switch + draw can be skipped. UploadBGVRAM/UploadBGPalette set these; the
+// per-layer config compare lives in PrerenderBGLayers. Conservative: any dirty
+// signal re-renders (errs toward redrawing, never toward stale output).
+static bool sBGVRAMDirty[2]        = { true, true };
+static bool sBGPalDirty[2]         = { true, true };
+static bool sBGCacheValid[2]       = { false, false };
+static bool sBGLayerRendered[2][4] = { {false,false,false,false}, {false,false,false,false} };
+
+// Invalidate the upload/prerender caches. Must run whenever the BG textures/FBOs
+// are (re)created, since the caches above are file-static and otherwise survive a
+// renderer re-init (e.g. loading a different game) — a stale cache would then skip
+// uploads/draws into fresh, blank textures.
+static void ResetBGCaches()
+{
+    for (int u = 0; u < 2; u++)
+    {
+        sBGVRAMDirty[u] = true; sBGPalDirty[u] = true; sBGCacheValid[u] = false;
+        for (int l = 0; l < 4; l++) sBGLayerRendered[u][l] = false;
+    }
 }
 
 void GLRenderer2D::UploadBGVRAM(Unit* unit)
@@ -1016,15 +1233,27 @@ void GLRenderer2D::UploadBGVRAM(Unit* unit)
     unit->GetBGVRAM(vram, vrammask);
     int bgheight = (int)((vrammask + 1) >> 10);   // VRAM rows = texture height
 
+    // Per-unit upload cache mirroring VRAMTex_BG. Max ABG VRAM is 512 KB
+    // (bgheight ≤ 512); oversized configs disable gating and upload unconditionally.
+    // sBGCacheValid is file-static (reset in Init via ResetBGCaches).
+    static u8   sBGTexCache[2][512 * 1024];
+    u8* cache = ((u32)bgheight * 1024 <= sizeof(sBGTexCache[0])) ? sBGTexCache[num] : nullptr;
+    bool gate = cache && sBGCacheValid[num];
+
     glBindTexture(GL_TEXTURE_2D, VRAMTex_BG[num]);
 
+    bool uploaded = false;
     for (int layer = 0; layer < 4; layer++)
     {
         if (!(BGLayerActive[num] & (1u << layer))) continue;
         // [0]=tile start, [1]=tile size; [2]=map/bitmap start, [3]=map/bitmap size
-        uploadVRAMRange(vram, BGVRAMRange[num][layer][0], BGVRAMRange[num][layer][1], bgheight);
-        uploadVRAMRange(vram, BGVRAMRange[num][layer][2], BGVRAMRange[num][layer][3], bgheight);
+        uploaded |= uploadVRAMRange(vram, cache, gate, BGVRAMRange[num][layer][0], BGVRAMRange[num][layer][1], bgheight);
+        uploaded |= uploadVRAMRange(vram, cache, gate, BGVRAMRange[num][layer][2], BGVRAMRange[num][layer][3], bgheight);
     }
+    // If gating is disabled (no cache / first frame) treat VRAM as dirty so the
+    // prerender always runs until the cache is primed.
+    sBGVRAMDirty[num] = uploaded || !gate;
+    if (cache) sBGCacheValid[num] = true;
 }
 
 void GLRenderer2D::UploadBGPalette(Unit* unit)
@@ -1117,8 +1346,12 @@ void GLRenderer2D::UploadBGPalette(Unit* unit)
     // frame (it keeps the flat VRAM buffer coherent with the VRAM bank writes).
     if (PalBGValid[num] &&
         memcmp(temp, PrevPalBG[num], sizeof(u16) * kBGPalEntries) == 0)
+    {
+        sBGPalDirty[num] = false;
         return;
+    }
 
+    sBGPalDirty[num] = true;
     memcpy(PrevPalBG[num], temp, sizeof(u16) * kBGPalEntries);
     PalBGValid[num] = true;
 
@@ -1144,14 +1377,11 @@ void GLRenderer2D::PrerenderLayer(int layer, Unit* unit)
 
     if (cfg.Type >= 6) return;   // 3D layer — composited from GPU3D output at C4
 
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    // READ-fb=0, RectVtxBuffer and the VAO are bound once by the caller (constant
+    // across all BG layers); only the draw target / uniform / viewport vary here.
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, BGLayerFB[num][layer]);
-
     glUniform1i(LayerPreCurBGULoc, layer);
     glViewport(0, 0, cfg.Size[0], cfg.Size[1]);
-
-    glBindBuffer(GL_ARRAY_BUFFER, RectVtxBuffer);
-    glBindVertexArray(RectVtxArray);
     glDrawArrays(GL_TRIANGLES, 0, 2 * 3);
 }
 
@@ -1159,20 +1389,27 @@ void GLRenderer2D::PrerenderBGLayers(Unit* unit)
 {
     const int num = unit->Num;
 
+    u64 t_p = GL2D_PROF_NOW();
     UpdateLayerConfig(unit);   // fills LayerConfig + BGVRAMRange + BGLayerActive
+    GL2D_PROF_ADD(BGConfigNS, t_p);
 
+    t_p = GL2D_PROF_NOW();
     UploadBGVRAM(unit);
+    GL2D_PROF_ADD(BGVRAMNS, t_p);
+
+    t_p = GL2D_PROF_NOW();
     UploadBGPalette(unit);
+    GL2D_PROF_ADD(BGPalNS, t_p);
 
 
-    // ── One-shot debug dump: first frame where at least one BG layer is enabled ──
-    static bool bgDumped[2]   = { false, false };
-    static bool pxDumped[2]   = { false, false };
+    // ── Periodic BG state dump: fires every 300 frames while BGs are enabled ──
+    static int  bgDumpCount[2] = { 0, 0 };
+    static bool pxDumped[2]    = { false, false };
     bool doPixelReadback = false;
-    if (YAGE_MELONDS_GL_DIAG && !bgDumped[num] &&
-        ((unit->DispCnt >> 8) & 0x0F) != 0)
+    const bool bgEnabled = ((unit->DispCnt >> 8) & 0x0F) != 0;
+    if (YAGE_MELONDS_GL_DIAG && bgEnabled &&
+        (++bgDumpCount[num] % 300 == 1))
     {
-        bgDumped[num]   = true;
         doPixelReadback = true;
         u8* vram; u32 vrammask;
         unit->GetBGVRAM(vram, vrammask);
@@ -1202,42 +1439,85 @@ void GLRenderer2D::PrerenderBGLayers(Unit* unit)
 
     if (!BGLayerActive[num]) return;
 
-    glUseProgram(LayerPreShader[2]);
+    // ── BG prerender cache: decide which active layers must be re-rendered ──
+    // A layer's prerendered texture (BGLayerFB[num][layer]) stays valid unless its
+    // inputs change: BG VRAM (tiles/map), BG palette, or that layer's config. When
+    // none changed, skip its FBO-switch + draw and reuse last frame's texture.
+    // (Scroll/window/blend are applied later in RenderScreen, not here, so they do
+    // not invalidate the prerender.)
+    // Compare the WHOLE per-unit LayerConfig (uBGConfig for all layers + uVRAMMask +
+    // any other global prerender state the shader reads), not just one layer's slice,
+    // so no prerender input is missed. LayerConfig holds only the static BG config
+    // (scroll/window/blend live in the compositor config, applied later), so it stays
+    // stable across frames and the cache hits whenever the game isn't reconfiguring BGs.
+    static u8    sPrevLayerCfg[2][2048];
+    const size_t lcSz = sizeof(LayerConfig[num]);
+    const bool   cfgCacheable = lcSz <= sizeof(sPrevLayerCfg[0]);
+    const bool   cfgChanged = !cfgCacheable ||
+                              memcmp(&LayerConfig[num], sPrevLayerCfg[num], lcSz) != 0;
+    if (cfgChanged && cfgCacheable)
+        memcpy(sPrevLayerCfg[num], &LayerConfig[num], lcSz);
+    const bool inputsDirty = sBGVRAMDirty[num] || sBGPalDirty[num] || cfgChanged;
 
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_STENCIL_TEST);
-    glDisable(GL_BLEND);
-    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glDepthMask(GL_FALSE);
-
-    glBindBufferBase(GL_UNIFORM_BUFFER, 20, LayerConfigUBO[num]);
-
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, VRAMTex_BG[num]);
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, PalTex_BG[num]);
-
+    bool needRender[4] = { false, false, false, false };
+    bool anyRender = false;
     for (int layer = 0; layer < 4; layer++)
     {
         if (!(BGLayerActive[num] & (1u << layer))) continue;
-        PrerenderLayer(layer, unit);
-
-        // One-shot pixel readback on the first BG-enabled frame only.
-        if (doPixelReadback && !pxDumped[num])
+        needRender[layer] = inputsDirty || !sBGLayerRendered[num][layer];
+        if (needRender[layer])
         {
-            glFinish();
-            u8 px[4] = {0, 0, 0, 0};
-            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, BGLayerFB[num][layer]);
-            glReadBuffer(GL_COLOR_ATTACHMENT0);
-            glReadPixels(4, 4, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
-            GL2D_CHK("readback");
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-            MELONDS_2D_LOG("  L%d pixel(4,4): r=%u g=%u b=%u a=%u", layer, px[0], px[1], px[2], px[3]);
-            if (layer == 3) pxDumped[num] = true;
+            anyRender = true;
+            sBGLayerRendered[num][layer] = true;
         }
     }
+
+    t_p = GL2D_PROF_NOW();
+    if (anyRender)
+    {
+        glUseProgram(LayerPreShader[2]);
+
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_STENCIL_TEST);
+        glDisable(GL_BLEND);
+        glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glDepthMask(GL_FALSE);
+
+        glBindBufferBase(GL_UNIFORM_BUFFER, 20, LayerConfigUBO[num]);
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, VRAMTex_BG[num]);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, PalTex_BG[num]);
+
+        // Hoisted out of PrerenderLayer — constant across all BG layers.
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        glBindBuffer(GL_ARRAY_BUFFER, RectVtxBuffer);
+        glBindVertexArray(RectVtxArray);
+
+        for (int layer = 0; layer < 4; layer++)
+        {
+            if (!(BGLayerActive[num] & (1u << layer))) continue;
+            if (!needRender[layer]) continue;
+            PrerenderLayer(layer, unit);
+
+            // Periodic pixel readback — fires when doPixelReadback is set (every 300f).
+            if (doPixelReadback)
+            {
+                glFinish();
+                u8 px[4] = {0, 0, 0, 0};
+                glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, BGLayerFB[num][layer]);
+                glReadBuffer(GL_COLOR_ATTACHMENT0);
+                glReadPixels(4, 4, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                GL2D_CHK("readback");
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+                MELONDS_2D_LOG("  L%d pixel(4,4): r=%u g=%u b=%u a=%u", layer, px[0], px[1], px[2], px[3]);
+            }
+        }
+    }
+    GL2D_PROF_ADD(BGDrawNS, t_p);
 }
 
 // ── Sprites (C3.1) ─────────────────────────────────────────────────────────
@@ -1434,10 +1714,9 @@ void GLRenderer2D::UpdateOAM(int ystart, int yend, Unit* unit)
                     &cfg);
 }
 
-// Upload the whole OBJ VRAM region into the unit's R8UI texture. The fork has
-// no dirty tracking (cf. UploadBGVRAM uploading referenced ranges); sprite tile
-// reads are scattered, so we upload all of it each frame — correctness first;
-// delta uploads are a Phase-D perf optimisation. Call before PrerenderSprites.
+// Upload the whole OBJ VRAM region into the unit's R8UI texture when it changed.
+// OAM movement is common while sprite tile data is static, and repeated 128-256
+// KB glTexSubImage2D calls were a visible TV-frame cost.
 void GLRenderer2D::UploadOBJVRAM(Unit* unit)
 {
     const int num = unit->Num;
@@ -1455,7 +1734,25 @@ void GLRenderer2D::UploadOBJVRAM(Unit* unit)
 
     u8* vram; u32 vrammask;
     unit->GetOBJVRAM(vram, vrammask);
-    int objheight = (int)((vrammask + 1) >> 10);   // VRAM rows = texture height
+    if (!vram)
+        return;
+
+    u32 bytes = vrammask + 1;
+    if (bytes > (u32)kOBJVRAMBytes)
+        bytes = (u32)kOBJVRAMBytes;
+    if (bytes == 0)
+        return;
+
+    if (OBJVRAMValid[num] &&
+        PrevOBJVRAMBytes[num] == bytes &&
+        memcmp(vram, PrevOBJVRAM[num], bytes) == 0)
+        return;
+
+    memcpy(PrevOBJVRAM[num], vram, bytes);
+    PrevOBJVRAMBytes[num] = bytes;
+    OBJVRAMValid[num] = true;
+
+    int objheight = (int)((bytes + 1023) >> 10);   // VRAM rows = texture height
 
     glBindTexture(GL_TEXTURE_2D, VRAMTex_OBJ[num]);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1024, objheight,
@@ -1889,8 +2186,27 @@ void GLRenderer2D::RenderScreen(int ystart, int yend, Unit* unit)
 
         glClear(GL_COLOR_BUFFER_BIT);
         glDisable(GL_SCISSOR_TEST);
+
+        // Periodic log — fires every 60 frames so transitions are caught.
+        static int inactiveCount[2] = { 0, 0 };
+        if (++inactiveCount[num] % 60 == 1)
+        {
+            const char* reason = forcedBlank ? "forced-blank(WHITE)"
+                               : !unitEnabled ? "engine-disabled(BLACK)"
+                               :                "dispmode=0(BLACK)";
+            MELONDS_2D_LOG("UNIT-INACTIVE u%d f=%d %s DispCnt=%08X En=%d dispmode=%u",
+                           num, inactiveCount[num], reason,
+                           unit->DispCnt, (int)unit->Enabled, dispmode);
+        }
         return;
     }
+
+    // Periodic log — fires every 60 frames so steady-state is visible.
+    static int activeCount[2] = { 0, 0 };
+    if (++activeCount[num] % 60 == 1)
+        MELONDS_2D_LOG("UNIT-ACTIVE u%d f=%d DispCnt=%08X En=%d dispmode=%u BGAct=%X",
+                       num, activeCount[num], unit->DispCnt,
+                       (int)unit->Enabled, dispmode, BGLayerActive[num]);
 
     glUseProgram(CompositorShader[2]);
 
@@ -1995,10 +2311,10 @@ void GLRenderer2D::RenderScreen(int ystart, int yend, Unit* unit)
         else
             glBindTexture(GL_TEXTURE_2D, BGLayerTex[num][i]);
 
-        // ⚠ GLES3.0 has no GL_CLAMP_TO_BORDER (GLES3.2 / EXT_texture_border_clamp).
-        // Upstream uses CLAMP_TO_BORDER so out-of-bounds affine/rotscale reads
-        // come back transparent; CLAMP_TO_EDGE smears the edge texel instead.
-        // To resolve at C4.2 (detect the EXT, or bounds-check in the FS).
+        // GLES3.0 has no GL_CLAMP_TO_BORDER (GLES3.2 / EXT_texture_border_clamp).
+        // Upstream expects out-of-bounds affine/rotscale reads to be transparent;
+        // the compositor shader does that bounds check before sampling. Keep
+        // CLAMP_TO_EDGE here only as a safe sampler fallback near the boundary.
         GLint wrapmode = LayerConfig[num].uBGConfig[i].Clamp ? GL_CLAMP_TO_EDGE : GL_REPEAT;
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapmode);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrapmode);
@@ -2177,6 +2493,28 @@ void GLRenderer2D::BindOutputTextureForScreen(int screen)
     BindOutputTexture(OutputScreenUnit[screen & 1]);
 }
 
+// ── M27 parallel render (hybrid) ──────────────────────────────────────────
+// When enabled by the frontend (yage), DrawScanline(191) does NOT render
+// inline on the emulation thread. Instead it records the unit as "pending" and
+// the frontend's render worker — which holds a shared EGL context — drains the
+// pending units via melonds_m27_execute() so the heavy GL composite overlaps
+// the next frame's CPU emulation. Internal linkage; referenced by the extern
+// "C" hooks at the end of this file via GPU2D:: qualification.
+static bool   m27Enabled            = false;
+static Unit*  m27PendingUnit[2]     = { nullptr, nullptr };
+static GLRenderer2D* m27Renderer    = nullptr;
+
+struct M27UnitSnap {
+    u32  DispCnt;
+    u16  BGCnt[4];
+    u16  BlendCnt;
+    u8   EVA, EVB, EVY;
+    bool Enabled;
+    bool preRenderDone;
+};
+static M27UnitSnap m27Snap[2] = {};
+
+
 void GLRenderer2D::DrawScanline(u32 line, Unit* unit)
 {
     if (line >= 192) return;
@@ -2189,7 +2527,66 @@ void GLRenderer2D::DrawScanline(u32 line, Unit* unit)
 
     // All 192 scanlines captured for this unit → run the GPU pipeline.
     if (line == 191)
-        RenderFrame(unit);
+    {
+        // Periodic log: confirms both units reach DrawScanline(191); fires every 60 frames.
+        static int scanlineCount[2] = { 0, 0 };
+        const int n191 = unit->Num & 1;
+        if (++scanlineCount[n191] % 60 == 1)
+            MELONDS_2D_LOG("SCANLINE191 u%d f=%d DispCnt=%08X En=%d m27=%d",
+                           n191, scanlineCount[n191], unit->DispCnt,
+                           (int)unit->Enabled, (int)m27Enabled);
+
+        if (m27Enabled)
+        {
+            const int n = unit->Num & 1;
+
+            // Snapshot frame-N registers before VBlank can mutate them.
+            m27Snap[n].DispCnt  = unit->DispCnt;
+            memcpy(m27Snap[n].BGCnt, unit->BGCnt, sizeof(m27Snap[n].BGCnt));
+            m27Snap[n].BlendCnt = unit->BlendCnt;
+            m27Snap[n].EVA      = unit->EVA;
+            m27Snap[n].EVB      = unit->EVB;
+            m27Snap[n].EVY      = unit->EVY;
+            m27Snap[n].Enabled  = unit->Enabled;
+            m27Snap[n].preRenderDone = false;
+
+            bool forcedBlank = !!(unit->DispCnt & (1u << 7));
+            bool unitEnabled = unit->Enabled;
+            u32 dispmode = (unit->DispCnt >> 16) & (n ? 0x1u : 0x3u);
+
+            if (!forcedBlank && unitEnabled && dispmode != 0)
+            {
+                PrerenderBGLayers(unit);    GL2D_CHK("m27:PrerenderBGLayers");
+
+                bool objWorkEnabled = !!(unit->DispCnt & ((1u << 12) | (1u << 15)));
+                if (objWorkEnabled)
+                {
+                    UpdateOAM(0, 192, unit);    GL2D_CHK("m27:UpdateOAM");
+                    if (NumSprites[n] > 0)
+                    {
+                        UploadOBJVRAM(unit);        GL2D_CHK("m27:UploadOBJVRAM");
+                        UploadOBJPalette(unit);     GL2D_CHK("m27:UploadOBJPalette");
+                        PrerenderSprites(unit);     GL2D_CHK("m27:PrerenderSprites");
+                    }
+                }
+                else
+                {
+                    NumSprites[n] = 0;
+                    SpriteUseMosaic[n] = false;
+                }
+                LastSpriteLine[n] = 0;
+                DoRenderSprites(192, unit);  GL2D_CHK("m27:DoRenderSprites");
+
+                glFlush();
+                m27Snap[n].preRenderDone = true;
+            }
+
+            m27Renderer = this;
+            m27PendingUnit[n] = unit;
+        }
+        else
+            RenderFrame(unit);
+    }
 }
 
 void GLRenderer2D::DrawSprites(u32 line, Unit* unit)
@@ -2214,22 +2611,63 @@ void GLRenderer2D::RenderFrame(Unit* unit)
 
     GL2D_CHK("RenderFrame:enter");   // drain errors inherited from 3D/libretro
 
+    const u64 t_total = GL2D_PROF_NOW();
+
+    bool forcedBlank = !!(unit->DispCnt & (1u << 7));
+    bool unitEnabled = unit->Enabled;
+    u32 dispmode = (unit->DispCnt >> 16) & (num ? 0x1u : 0x3u);
+
+    if (forcedBlank || !unitEnabled || dispmode == 0)
+    {
+        LastSpriteLine[num] = 0;
+        LastLine[num] = 0;
+        const u64 t_comp = GL2D_PROF_NOW();
+        RenderScreen(0, 192, unit);  GL2D_CHK("RenderScreen:inactive");
+        GL2D_PROF_ADD(CompositeNS, t_comp);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        GL2D_CHK("RenderFrame:inactive-ready");
+        GL2D_PROF_ADD(TotalNS, t_total);
+#if A32JIT_PROFILE
+        GL2DProfile.Calls++; GL2DProfileMaybeLog();
+#endif
+        return;
+    }
+
     // BG layers: derive config + upload referenced VRAM/palette + pre-render
     // each active layer into its AllBGLayer texture.
+    const u64 t_bg = GL2D_PROF_NOW();
     PrerenderBGLayers(unit);   GL2D_CHK("PrerenderBGLayers");
+    GL2D_PROF_ADD(BGNS, t_bg);
 
-    // Sprites: scan OAM, upload OBJ VRAM/palette, rasterise the atlas, then
-    // composite the OBJ layer for all 192 scanlines.
-    UpdateOAM(0, 192, unit);    GL2D_CHK("UpdateOAM");
-    UploadOBJVRAM(unit);        GL2D_CHK("UploadOBJVRAM");
-    UploadOBJPalette(unit);     GL2D_CHK("UploadOBJPalette");
-    PrerenderSprites(unit);     GL2D_CHK("PrerenderSprites");
+    // Sprites: scan OAM only when OBJ pixels or OBJ-window masks can affect
+    // the frame. If no visible sprites remain, DoRenderSprites still clears
+    // the OBJ target for the compositor but skips the atlas/VRAM/palette work.
+    const u64 t_obj = GL2D_PROF_NOW();
+    bool objWorkEnabled = !!(unit->DispCnt & ((1u << 12) | (1u << 15)));
+    if (objWorkEnabled)
+    {
+        UpdateOAM(0, 192, unit);    GL2D_CHK("UpdateOAM");
+        if (NumSprites[num] > 0)
+        {
+            UploadOBJVRAM(unit);        GL2D_CHK("UploadOBJVRAM");
+            UploadOBJPalette(unit);     GL2D_CHK("UploadOBJPalette");
+            PrerenderSprites(unit);     GL2D_CHK("PrerenderSprites");
+        }
+    }
+    else
+    {
+        NumSprites[num] = 0;
+        SpriteUseMosaic[num] = false;
+    }
     LastSpriteLine[num] = 0;
     DoRenderSprites(192, unit);  GL2D_CHK("DoRenderSprites");
+    GL2D_PROF_ADD(SpriteNS, t_obj);
 
     // Composite BG + OBJ (+ GPU3D as BG0) into OutputTex.
     LastLine[num] = 0;
+    const u64 t_comp = GL2D_PROF_NOW();
     RenderScreen(0, 192, unit);  GL2D_CHK("RenderScreen");
+    GL2D_PROF_ADD(CompositeNS, t_comp);
 
     // Present is handled by libretro/opengl.cpp sampling OutputTex directly.
     // Do not glReadPixels here: several GLES drivers reject readback from these
@@ -2237,19 +2675,179 @@ void GLRenderer2D::RenderFrame(Unit* unit)
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     GL2D_CHK("RenderFrame:present-ready");
 
-    // TEMP one-shot per-unit state dump: tells us whether a black screen is a
-    // forced-blank/disabled engine, no active layers, or a genuinely empty
-    // composite (centerPx = middle pixel of the read-back screen).
-    static bool dumped[2] = { false, false };
-    if (YAGE_MELONDS_GL_DIAG && !dumped[num])
+    // ── Periodic full-state diagnostics ──────────────────────────────────────
+    static int rfCount[2] = { 0, 0 };
+    const int rfc = ++rfCount[num];
+
+    if (YAGE_MELONDS_GL_DIAG && (rfc % 60 == 1))
     {
-        dumped[num] = true;
-        MELONDS_2D_LOG("2D-STATE u%d DispCnt=%08X En=%d fblank=%d BGAct=%X NumSpr=%d "
-                       "Out3D=%u OutFB=%u OutTex=%u",
-                       num, unit->DispCnt, (int)unit->Enabled,
-                       (int)!!(unit->DispCnt & (1u << 7)), BGLayerActive[num],
-                       NumSprites[num], Output3DTex, OutputFB[num], OutputTex[num]);
+        // VRAM non-zero byte count (quick coherency check — if zero, tiles are blank)
+        u8* bgvram = nullptr; u32 bgvrammask = 0;
+        unit->GetBGVRAM(bgvram, bgvrammask);
+        int vramNZ = 0;
+        if (bgvram) for (u32 i = 0; i <= bgvrammask && i < (1u << 20); i++)
+            if (bgvram[i]) vramNZ++;
+        // standard BG palette non-zero entry count
+        const u16* stdpal = (const u16*)&GPU::Palette[num ? 0x400 : 0];
+        int palNZ = 0;
+        for (int i = 0; i < 256; i++) if (stdpal[i]) palNZ++;
+        // ext palette non-zero entries across all 4 slots (slot 0 only for speed)
+        int extNZ = 0;
+        const u16* ep0 = unit->GetBGExtPal(0, 0);
+        if (ep0) for (int i = 0; i < 256; i++) if (ep0[i]) extNZ++;
+
+        MELONDS_2D_LOG("2D-STATE u%d f=%d DispCnt=%08X mode=%u disp=%u BGAct=%X "
+                       "fblank=%d Spr=%d vramNZ=%d palNZ=%d extNZ=%d FBO=%u Tex=%u",
+                       num, rfc, unit->DispCnt, unit->DispCnt & 7, dispmode,
+                       BGLayerActive[num], (int)!!(unit->DispCnt & (1u << 7)),
+                       NumSprites[num], vramNZ, palNZ, extNZ,
+                       OutputFB[num], OutputTex[num]);
+    }
+
+    // ── Pixel probe every 300 frames: ground-truth for what OutputTex holds ──
+    if (YAGE_MELONDS_GL_DIAG && (rfc % 300 == 1))
+    {
+        static const int probeY[5] = { 16, 48, 96, 144, 176 };
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, OutputFB[num]);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        char logbuf[256];
+        int off = snprintf(logbuf, sizeof(logbuf), "OUT-PROBE u%d f=%d:", num, rfc);
+        bool allBlack = true, allWhite = true;
+        for (int yi = 0; yi < 5; yi++)
+        {
+            GLubyte px[4] = {0};
+            glReadPixels(128, probeY[yi], 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            // OutputTex stores BGR in RGBA → un-swizzle for logging
+            off += snprintf(logbuf + off, sizeof(logbuf) - off,
+                            " y%d=rgb(%u,%u,%u)", probeY[yi], px[2], px[1], px[0]);
+            if (px[0] || px[1] || px[2]) allBlack = false;
+            if (px[0] < 230 || px[1] < 230 || px[2] < 230) allWhite = false;
+        }
+        if (allBlack)       strncat(logbuf, " [ALL-BLACK]", sizeof(logbuf) - strlen(logbuf) - 1);
+        else if (allWhite)  strncat(logbuf, " [ALL-WHITE]", sizeof(logbuf) - strlen(logbuf) - 1);
+        MELONDS_2D_LOG("%s", logbuf);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+
+        // Per-layer BG texture probe (what did the prerender produce?)
+        for (int l = 0; l < 4; l++)
+        {
+            if (!(BGLayerActive[num] & (1u << l))) continue;
+            if (!BGLayerTex[num][l]) continue;
+            GLuint bgfbo;
+            glGenFramebuffers(1, &bgfbo);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, bgfbo);
+            glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_2D, BGLayerTex[num][l], 0);
+            if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE)
+            {
+                glReadBuffer(GL_COLOR_ATTACHMENT0);
+                GLubyte pa[4] = {0}, pb[4] = {0};
+                glReadPixels(128, 128, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pa);
+                glReadPixels(64,   64, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pb);
+                MELONDS_2D_LOG("BG-PROBE u%d f=%d L%d:"
+                               " (128,128)=(%u,%u,%u,a%u) (64,64)=(%u,%u,%u,a%u)",
+                               num, rfc, l,
+                               pa[0], pa[1], pa[2], pa[3],
+                               pb[0], pb[1], pb[2], pb[3]);
+            }
+            glDeleteFramebuffers(1, &bgfbo);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        }
+    }
+
+    GL2D_PROF_ADD(TotalNS, t_total);
+#if A32JIT_PROFILE
+    GL2DProfile.Calls++; GL2DProfileMaybeLog();
+#endif
+}
+
+}
+
+// ── M27 hybrid parallel-render hooks (called by the yage frontend) ──────────
+// The render worker (yage) owns a shared EGL context; these C entry points let
+// it drain the units that DrawScanline(191) deferred while the emulation thread
+// races ahead into the next frame.
+//   melonds_m27_set_enabled : toggle deferral (off → inline render, as before)
+//   melonds_m27_has_pending : 1 if a deferred frame is waiting
+//   melonds_m27_execute     : run the deferred RenderFrame(s) on the CALLING
+//                             thread (must hold the shared GL context current)
+#define M27_EXPORT __attribute__((visibility("default")))
+
+namespace GPU2D {
+void GLRenderer2D::RenderPending()
+{
+    for (int n = 0; n < 2; n++)
+    {
+        if (!m27PendingUnit[n])
+            continue;
+
+        Unit* unit = m27PendingUnit[n];
+        m27PendingUnit[n] = nullptr;
+        const auto& snap = m27Snap[n];
+
+        if (!snap.preRenderDone)
+        {
+            // Forced-blank/disabled — no pre-render was done; full path.
+            RenderFrame(unit);
+            continue;
+        }
+
+        // BG/sprite pre-render used frame-N registers. Temporarily restore
+        // them so RenderScreen's UpdateCompositorConfig uses the same values
+        // (ARM9 may have mutated them during VBlank).
+        const u32  savedDispCnt  = unit->DispCnt;
+        const u16  savedBlendCnt = unit->BlendCnt;
+        const u8   savedEVA = unit->EVA, savedEVB = unit->EVB, savedEVY = unit->EVY;
+        const bool savedEnabled  = unit->Enabled;
+        u16 savedBGCnt[4];
+        memcpy(savedBGCnt, unit->BGCnt, sizeof(savedBGCnt));
+
+        unit->DispCnt  = snap.DispCnt;
+        memcpy(unit->BGCnt, snap.BGCnt, sizeof(snap.BGCnt));
+        unit->BlendCnt = snap.BlendCnt;
+        unit->EVA      = snap.EVA;
+        unit->EVB      = snap.EVB;
+        unit->EVY      = snap.EVY;
+        unit->Enabled  = snap.Enabled;
+
+        LastLine[n] = 0;
+        RenderScreen(0, 192, unit);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+        // Restore live ARM9 state.
+        unit->DispCnt  = savedDispCnt;
+        memcpy(unit->BGCnt, savedBGCnt, sizeof(savedBGCnt));
+        unit->BlendCnt = savedBlendCnt;
+        unit->EVA      = savedEVA;
+        unit->EVB      = savedEVB;
+        unit->EVY      = savedEVY;
+        unit->Enabled  = savedEnabled;
+    }
+}
+}
+
+extern "C" M27_EXPORT void melonds_m27_set_enabled(int en)
+{
+    GPU2D::m27Enabled = (en != 0);
+    if (!GPU2D::m27Enabled)
+    {
+        GPU2D::m27PendingUnit[0] = nullptr;
+        GPU2D::m27PendingUnit[1] = nullptr;
     }
 }
 
+extern "C" M27_EXPORT int melonds_m27_is_enabled(void)
+{
+    return GPU2D::m27Enabled ? 1 : 0;
+}
+
+extern "C" M27_EXPORT int melonds_m27_has_pending(void)
+{
+    return (GPU2D::m27PendingUnit[0] || GPU2D::m27PendingUnit[1]) ? 1 : 0;
+}
+
+extern "C" M27_EXPORT void melonds_m27_execute(void)
+{
+    if (GPU2D::m27Renderer)
+        GPU2D::m27Renderer->RenderPending();
 }

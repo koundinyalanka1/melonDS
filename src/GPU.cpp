@@ -555,6 +555,11 @@ void SetRenderSettings(int renderer, RenderSettings& settings)
     {
         CurGLCompositor->SetRenderSettings(settings);
         GPU3D::CurrentRenderer->SetRenderSettings(settings);
+        if (GL2DActive)
+        {
+            auto* gl2d = static_cast<GPU2D::GLRenderer2D*>(GPU2D_Renderer.get());
+            gl2d->SetScaleFactor(settings.GL_ScaleFactor);
+        }
     }
 #endif
 }

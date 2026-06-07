@@ -3,12 +3,6 @@
  * #if defined(HAVE_OPENGL) blocks but which are absent from GLES3.0/3.1. */
 #pragma once
 
-/* ── Draw buffer selection ─────────────────────────────────────────────────
- * glDrawBuffer: not in GLES3 — back buffer is always the sole draw target. */
-#ifndef glDrawBuffer
-#  define glDrawBuffer(buf) ((void)(buf))
-#endif
-
 /* ── Base-vertex draw calls (GLES3.2+ / GL_EXT_draw_elements_base_vertex) ──
  * Fall back to standard draw calls (basevertex ignored). */
 #ifndef glDrawElementsBaseVertex
