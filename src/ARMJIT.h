@@ -49,6 +49,13 @@ void CompileBlock(ARM* cpu);
 
 void ResetBlockCache();
 
+// M29 Phase 7 (code-cache wrap-around): evict every block whose host EntryPoint
+// lies in [lo, hi) so the JIT code-buffer region can be safely reused without a
+// full ResetBlockCache().  Purges JitBlocks9/7, RestoreCandidates and the fast
+// lookup; leaves AddressRange.Code/page protection set (self-heals on the next
+// SMC write or recompile).  Called by the A32 compiler's generational allocator.
+void EvictBlocksInHostCodeRange(u8* lo, u8* hi);
+
 JitBlockEntry LookUpBlock(u32 num, u64* entries, u32 offset, u32 addr);
 bool SetupExecutableRegion(u32 num, u32 blockAddr, u64*& entry, u32& start, u32& size);
 

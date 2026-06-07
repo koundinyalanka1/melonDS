@@ -24,6 +24,15 @@
 #include "FIFO.h"
 #include "Config.h"
 
+// M29 Phase 6: NEON-vectorised 20.12 fixed-point matrix multiply.  The geometry
+// engine multiplies 4x4 / 4x3 matrices on every MTX_MULT command and rebuilds the
+// clip matrix on demand — hot on the ARM9-bound BRAVIA target.  Guarded so the
+// scalar path stays the source of truth on non-NEON builds (x86_64 desktop, etc.).
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    #include <arm_neon.h>
+    #define GPU3D_HAS_NEON 1
+#endif
+
 
 // 3D engine notes
 //
@@ -662,8 +671,70 @@ void MatrixLoad4x3(s32* m, s32* s)
     m[12] = s[9]; m[13] = s[10]; m[14] = s[11]; m[15] = 0x1000;
 }
 
+#ifdef GPU3D_HAS_NEON
+
+// out_row[c] = ( sum_k s[srow*4+k] * tmp[k*4+c] ) >> 12, for c = 0..3.
+// Each term is a scalar (s) times a tmp row vector; widening s32*s32->s64 keeps
+// the full 20.12 product, matching the scalar (s64)a*b >> 12.  vshrn_n_s64 is a
+// truncating narrow (low 32 bits after >>12) — identical to the scalar's
+// arithmetic-shift-then-assign-to-s32.
+static inline void NeonMatRow(const int32x2_t* t /* [8]: row0lo,row0hi,...,row3lo,row3hi */,
+                              s32 s0, s32 s1, s32 s2, s32 s3, s32* out)
+{
+    int64x2_t lo = vmull_n_s32(t[0], s0);
+    int64x2_t hi = vmull_n_s32(t[1], s0);
+    lo = vmlal_n_s32(lo, t[2], s1); hi = vmlal_n_s32(hi, t[3], s1);
+    lo = vmlal_n_s32(lo, t[4], s2); hi = vmlal_n_s32(hi, t[5], s2);
+    lo = vmlal_n_s32(lo, t[6], s3); hi = vmlal_n_s32(hi, t[7], s3);
+    vst1_s32(&out[0], vshrn_n_s64(lo, 12));
+    vst1_s32(&out[2], vshrn_n_s64(hi, 12));
+}
+
+static inline void MatrixMult4x4_NEON(s32* m, const s32* s)
+{
+    s32 tmp[16];
+    memcpy(tmp, m, 16*4);
+
+    // tmp split into per-row lo (cols 0,1) / hi (cols 2,3) int32x2 lanes.
+    const int32x2_t t[8] = {
+        vld1_s32(&tmp[0]),  vld1_s32(&tmp[2]),
+        vld1_s32(&tmp[4]),  vld1_s32(&tmp[6]),
+        vld1_s32(&tmp[8]),  vld1_s32(&tmp[10]),
+        vld1_s32(&tmp[12]), vld1_s32(&tmp[14]),
+    };
+
+    for (int r = 0; r < 4; r++)
+        NeonMatRow(t, s[r*4+0], s[r*4+1], s[r*4+2], s[r*4+3], &m[r*4]);
+}
+
+static inline void MatrixMult4x3_NEON(s32* m, const s32* s)
+{
+    s32 tmp[16];
+    memcpy(tmp, m, 16*4);
+
+    const int32x2_t t[8] = {
+        vld1_s32(&tmp[0]),  vld1_s32(&tmp[2]),
+        vld1_s32(&tmp[4]),  vld1_s32(&tmp[6]),
+        vld1_s32(&tmp[8]),  vld1_s32(&tmp[10]),
+        vld1_s32(&tmp[12]), vld1_s32(&tmp[14]),
+    };
+
+    // Rows 0..2: 3 source terms each (the implicit 4th source column is 0).
+    for (int r = 0; r < 3; r++)
+        NeonMatRow(t, s[r*3+0], s[r*3+1], s[r*3+2], 0, &m[r*4]);
+
+    // Row 3 (translation): 3 terms + the implicit 1.0 (0x1000) on tmp row 3.
+    NeonMatRow(t, s[9], s[10], s[11], 0x1000, &m[12]);
+}
+
+#endif // GPU3D_HAS_NEON
+
 void MatrixMult4x4(s32* m, s32* s)
 {
+#ifdef GPU3D_HAS_NEON
+    MatrixMult4x4_NEON(m, s);
+    return;
+#endif
     s32 tmp[16];
     memcpy(tmp, m, 16*4);
 
@@ -691,6 +762,10 @@ void MatrixMult4x4(s32* m, s32* s)
 
 void MatrixMult4x3(s32* m, s32* s)
 {
+#ifdef GPU3D_HAS_NEON
+    MatrixMult4x3_NEON(m, s);
+    return;
+#endif
     s32 tmp[16];
     memcpy(tmp, m, 16*4);
 

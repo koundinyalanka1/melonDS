@@ -65,6 +65,23 @@ const bool EnableThumbMemImmDirect = true;
 // there — on ARM7 a Thumb POP-PC must set bit0, which that helper clears, so ARM7
 // POP-PC stays on RunThumbMemInstr). Any guard miss falls back to the helper.
 const bool EnableThumbBlockTransfer = true;
+
+// ── M29 optimisation kill switches ───────────────────────────────────────────
+// M29 Phase 1: write-back guest-register cache (pure-ALU runs keep guest regs in
+// callee-saved host R5–R11, reads become MOV instead of LDR, writes are deferred
+// and flushed at every block-exit / helper / barrier).  Flip false to revert to
+// always reading/writing cpu->R[] in memory.
+const bool EnableRegAllocator = true;
+// M29 Phase 2: lazy (deferred) flag evaluation — a flag-setting ALU op leaves its
+// result in the host CPSR and only spills NZCV into the guest CPSR when a consumer
+// (conditional, MRS, helper, block exit) actually needs it; dead flag writes are
+// dropped.  Flip false to spill flags eagerly after every ALU op.
+const bool EnableLazyFlags = true;
+// M29 Phase 7: generational code-cache wrap-around (see ARMJIT_Compiler.h).  This
+// is the one M29 lever that touches the *shared* block manager (ARMJIT.cpp); flip
+// false to restore the original full ResetBlockCache()-when-full behaviour.
+const bool EnableCodeCacheWrap = true;
+
 #ifndef A32JIT_PROFILE
 #define A32JIT_PROFILE 0
 #endif
@@ -77,6 +94,7 @@ alignas(4096) u8 JitMem[JitMemSize];
 // self-loop block — off the hot path (blocks compile once, run many times).
 u32 g_M18SelfLinkEmitted = 0;
 u32 g_M18FastBranchEmitted = 0;
+u32 g_M29CacheWrapCount = 0;   // M29 Phase 7: code-cache generational wrap events
 
 // Mirrors ARMJIT_A64/ARMJIT_Branch.cpp and CP15.cpp::kCodeCacheTiming.
 const int A32CodeCacheTiming = 3;
@@ -94,6 +112,7 @@ enum HostReg
     R8 = 8,
     R9 = 9,
     R10 = 10,
+    R11 = 11,
     R12 = 12,
 };
 
@@ -3652,10 +3671,25 @@ static void AnalyzeArmRegUsage(u32 op, u32& read, u32& written)
         }
         else if (bit4 && bit7)
         {
-            // Halfword/signed transfers (LDRH/STRH/LDRSB/LDRSH), bits[7:4]==1011/1101/1111.
+            // Extra load/store: halfword/signed (LDRH/STRH/LDRSB/LDRSH) AND the
+            // ARMv5TE doublewords LDRD/STRD (present on ARM9).  op2 = bits[6:5]:
+            //   01 → halfword;  10 → LDRSB (L=1) / LDRD (L=0);  11 → LDRSH (L=1) / STRD (L=0)
             addR(rn);
             if (!bit22) addR(rm);                 // bit22=0 → register offset
-            if (bit20) addW(rd); else addR(rd);   // load writes Rd, store reads it
+            const u32 op2 = (op >> 5) & 3;
+            if (!bit20 && op2 == 2)
+            {
+                // M29 LDRD fix: loads Rd AND Rd+1 (both written) — was wrongly
+                // analysed as a halfword store that only *reads* Rd.
+                addW(rd); addW(rd + 1);
+            }
+            else if (!bit20 && op2 == 3)
+            {
+                // M29 STRD fix: stores (reads) Rd AND Rd+1.
+                addR(rd); addR(rd + 1);
+            }
+            else if (bit20) addW(rd);             // LDRH/LDRSB/LDRSH load → writes Rd
+            else            addR(rd);             // STRH store → reads Rd
             if (!bit24 || bit21) addW(rn);        // post-index / writeback
         }
         else if (bit24 && !bit23 && !bit20)
@@ -3740,6 +3774,7 @@ void Compiler::Reset()
 {
     memset(CodeStart, 0, CodeSize);
     CodePtr = CodeStart;
+    m_curGen = 0;   // M29 Phase 7: full reset restarts at generation 0
 }
 
 bool Compiler::CanCompile(bool thumb, u16 kind)
@@ -3761,7 +3796,39 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     // blocks (Config::JIT_MaxBlockSize up to 128) from overrunning the 16 MB code
     // buffer, and is strictly safer than the old fixed 8192 for full 32-instr blocks.
     const u32 bytesNeeded = (u32)instrsCount * 320 + 512;
-    if (CodeSize - CodeOffset() < bytesNeeded)
+
+    // M29 Phase 7: generational wrap-around.  When the current block won't fit in
+    // the current generation, advance to the next one — evicting only that
+    // generation's stale blocks and reusing its host code — instead of throwing
+    // away the entire compiled working set with a full ResetBlockCache().  Falls
+    // back to a full reset only if a single block is larger than one generation
+    // (cannot happen: max block ≈ 10 KB ≪ 4 MB generation, but guarded anyway).
+    if (EnableCodeCacheWrap)
+    {
+        if ((u32)(GenEnd(m_curGen) - CodePtr) < bytesNeeded)
+        {
+            const u32 nextGen = (m_curGen + 1) % kCodeGenCount;
+            u8* lo = GenBase(nextGen);
+            u8* hi = GenEnd(nextGen);
+            if (bytesNeeded > (u32)(hi - lo))
+            {
+                A32JIT_LOGI("AArch32 JIT block too large for a generation, full reset...");
+                ResetBlockCache();   // resets CodePtr=CodeStart, m_curGen=0
+            }
+            else
+            {
+                ARMJIT::EvictBlocksInHostCodeRange(lo, hi);
+                m_curGen = nextGen;
+                CodePtr  = lo;
+                g_M29CacheWrapCount++;
+                if (g_M29CacheWrapCount == 1 || (g_M29CacheWrapCount & 0x3F) == 0)
+                    A32JIT_LOGI("melonDS A32 JIT M29 code-cache wrap ACTIVE: wraps=%u "
+                                "(now generation %u/%u)",
+                                g_M29CacheWrapCount, m_curGen, kCodeGenCount);
+            }
+        }
+    }
+    else if (CodeSize - CodeOffset() < bytesNeeded)
     {
         A32JIT_LOGI("AArch32 JIT memory full, resetting...");
         ResetBlockCache();
@@ -3776,49 +3843,15 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     // Cycle batching (6.9): reset pending cycle accumulator for this block.
     m_pendingCycles = 0;
 
-    // Register cache (6.1 Phase 1): analyse ARM-mode blocks to find pure-source
-    // guest registers (read but never written in the block) and cache them into
-    // host R5-R10 at block entry.  Thumb blocks get no cache (conservative).
-    // Self-link loops back to instrStart (after cache loads) to skip redundant reloads.
-    //
-    // DISABLED (correctness regression): the pinning is only safe if
-    // AnalyzeArmRegUsage()'s `written` set is a *strict superset* of every guest
-    // register an instruction can modify.  Any decode hole lets a pinned register
-    // go stale, and because the cache is loaded once at block entry the guest then
-    // runs at full speed but computes wrong values — games boot, set
-    // DISPCNT=graphics, then loop forever with no BG layers ever enabled (the exact
-    // NSMB-on-BRAVIA hang).  The 32->128 JIT_MaxBlockSize bump made this reachable
-    // by putting a pinned register and a missed write in the same block.
-    //
-    // The author already patched several holes (MUL/MLA dest, MRS, SWP, halfword,
-    // MRC) but at least one remains: LDRD/STRD (ARMv5TE, present on ARM9) write
-    // Rd *and* Rd+1, yet are analysed as a halfword store that only *reads* Rd.
-    // Until liveness is provably complete, keep the cache off — EmitGuestLoad()
-    // then always reads cpu->R[N] from memory, which is unconditionally correct.
-    // This is only a minor pre-allocator optimisation, so the perf cost is small.
-    // Flip kEnableRegCache back to true once AnalyzeArmRegUsage is audited.
-    constexpr bool kEnableRegCache = false;
-    memset(m_rcHostReg, -1, sizeof(m_rcHostReg));
-    if (kEnableRegCache && !thumb)
-    {
-        u32 rcRead = 0, rcWritten = 0;
-        for (int i = 0; i < emitCount; i++)
-            AnalyzeArmRegUsage(instrs[i].Instr, rcRead, rcWritten);
-        // Candidates: read but never written, not SP/LR (R13/R14) which have implicit effects.
-        u32 candidates = rcRead & ~rcWritten & ~(1u << 13) & ~(1u << 14);
-        constexpr int kCacheHostRegs[] = { R5, R6, R7, R8, R9, R10 };
-        constexpr int kMaxCache = (int)(sizeof(kCacheHostRegs) / sizeof(kCacheHostRegs[0]));
-        int slot = 0;
-        for (int g = 0; g < 13 && slot < kMaxCache; g++)
-        {
-            if (candidates & (1u << g))
-            {
-                m_rcHostReg[g] = kCacheHostRegs[slot++];
-                EmitLoadReg(m_rcHostReg[g], R4,
-                            ArmMemberOffset(&ARM::R) + (u32)g * 4);
-            }
-        }
-    }
+    // M29 Phase 2: lazy flags start clean every block.
+    m_flagsDirty = false;
+    m_flagsDirtyMask = 0;
+
+    // M29 Phase 1: pick + load the write-back register cache for this block (sets
+    // m_rcHostReg / clears m_rcDirty).  The LDR preamble it emits lands *before*
+    // instrStart so the self-link loop-back skips re-loading every iteration.
+    RegAllocPrepareBlock(thumb, instrs, emitCount);
+
     // instrStart: self-link loops back here to skip the cache-load preamble.
     u8* instrStart = CodePtr;
 
@@ -3832,6 +3865,37 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
         bool forceExit = instr.Info.EndBlock || instr.Info.Branches() || instr.BranchFlags != 0;
         bool tailReturn = forceExit || i == (emitCount - 1);
 
+        // M29 Phase 1+2 barrier / lazy-flag sync.  Done BEFORE the tail cycle-flush
+        // and tailInstrCodePtr capture so any spill code survives the self-link
+        // rewind (which rewinds CodePtr to tailInstrCodePtr).
+        if (EnableRegAllocator || EnableLazyFlags)
+        {
+            if (IsRegCacheBarrierKind(thumb, instr))
+            {
+                // Non-ALU op (memory/branch/CPSR/coproc/helper): make guest state
+                // authoritative before it runs, then stop caching for the rest of
+                // the block (avoids fast/fallback merge-state divergence).
+                EmitFlushDirtyFlags();
+                FlushRegAllocForHelper();
+                DropRegAlloc();
+            }
+            else if (EnableLazyFlags && m_flagsDirty)
+            {
+                // Pure-ALU op with deferred flags pending.  Decide whether the
+                // pending NZCV is dead (this op fully overwrites it before any read)
+                // or must be spilled to guest CPSR to survive this op.
+                const u8 wf0   =  instr.Info.WriteFlags & 0xF;          // always-written
+                const u8 wfMay = (instr.Info.WriteFlags >> 4) & 0xF;    // maybe-written
+                const u8 rf    =  instr.Info.ReadFlags & 0xF;
+                if (wf0 == 0 && wfMay == 0 && rf == 0)
+                    { /* touches no flags → S=0 host ops preserve host CPSR, keep deferring */ }
+                else if (wf0 == 0xF && rf == 0)
+                    m_flagsDirty = false;          // fully overwrites NZCV, reads none → dead
+                else
+                    EmitFlushDirtyFlags();         // partial/maybe write or flag read → spill
+            }
+        }
+
         // M18: save pointer to the start of the tail instruction's emitted code.
         // Flush accumulated cycles from all non-tail instructions here so they
         // land before tailInstrCodePtr and are NOT rewound by the self-link path.
@@ -3844,6 +3908,15 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
 
         if (!TryEmitNative(instr, thumb, cpu, tailReturn))
             EmitInterpreterFallback(instr, thumb, tailReturn);
+
+        // M29 Phase 1: if a helper ran while the cache was still live (e.g. an ALU
+        // op that fell back to the interpreter), it flushed dirty regs before the
+        // call but may have changed cpu->R[] — drop the now-stale mappings.
+        if (m_rcPoison)
+        {
+            DropRegAlloc();
+            m_rcPoison = false;
+        }
 
         // Update block-local constant-propagation state (ARM mode only).
         if (!thumb)
@@ -4089,12 +4162,34 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
 
 bool Compiler::IsJITFault(u8* pc)
 {
-    (void)pc;
-    return false;
+    // M29 Phase 4 (FastMem foundation): a SIGSEGV originates from JIT-emitted code
+    // iff the faulting host PC lies inside our executable code buffer
+    // [CodeStart, CodeStart+CodeSize).  Faults from anywhere else (the interpreter,
+    // libretro, the renderer) are genuine crashes and must propagate.
+    //
+    // This is the gate the POSIX/Windows fault handler (ARMJIT_Memory.cpp:
+    // FaultHandler) uses to decide whether to map the faulting guest page and
+    // resume, vs. let the signal kill the process.
+    //
+    // 32-bit VA note / roadmap: a full fastmem backend would emit *unguarded* host
+    // loads/stores straight into a 4 GB guest-address-space mirror and rely on this
+    // handler to lazily map pages on first touch (RewriteMemAccess would then patch
+    // the faulting access to the guarded slow path).  On armeabi-v7a the usable
+    // user VA is only ~3 GB and fragmented, so the 4 GB+fault-mirror trick the x64
+    // backend uses isn't viable as-is; the A32 backend instead emits explicit
+    // direct-region guards (see TryEmitArmNativeMemory / the EmitDirectSafeRegion*
+    // helpers).  IsJITFault is implemented now so the handler is correct the moment
+    // a future increment starts emitting unguarded accesses; until then no emitted
+    // code faults, so this simply returns false in practice.
+    return CodeStart != nullptr && pc >= CodeStart && pc < (CodeStart + CodeSize);
 }
 
 u8* Compiler::RewriteMemAccess(u8* pc)
 {
+    // No unguarded fastmem accesses are emitted yet (see IsJITFault), so there is
+    // nothing to rewrite to a slow path.  Returning pc unchanged lets the faulting
+    // access re-execute after the handler maps the page; once real fastmem accesses
+    // exist this must patch pc's load/store to the guarded sequence.
     return pc;
 }
 
@@ -5679,7 +5774,7 @@ bool Compiler::TryEmitArmNative(const FetchedInstr& instr, ARM* cpu, bool tailRe
         u32 flagMask = isLogical
             ? (operand2UpdatesCarry ? CPSR_NZCMask : CPSR_NZMask)
             : CPSR_NZCVMask;
-        EmitCopyHostFlags(flagMask);
+        MarkHostFlagsDirty(flagMask);
     }
 
     EmitAddCycles(instr, false, cpu);
@@ -5696,7 +5791,8 @@ bool Compiler::TryEmitArmNative(const FetchedInstr& instr, ARM* cpu, bool tailRe
 // (IO/VRAM/misaligned/unmapped). Correctness can never regress: a guard miss just
 // takes the same helper the instruction used before.
 bool Compiler::TryEmitThumbMemImmDirect(const FetchedInstr& instr, ARM* cpu, bool tailReturn,
-                                        int rd, int rn, u32 offset, int size, bool load)
+                                        int rd, int rn, u32 offset, int size, bool load,
+                                        int offsetReg)
 {
     if (!EnableEmittedMainRAMLoadStore || !EnableThumbMemImmDirect)
         return false;
@@ -5745,9 +5841,15 @@ bool Compiler::TryEmitThumbMemImmDirect(const FetchedInstr& instr, ARM* cpu, boo
 
     EmitStoreR15(instr.Addr + 4);
 
-    // R0 = effective address = R[rn] + offset
+    // R0 = effective address.  Register-offset form (tk_*_REG): R[rn] + R[offsetReg].
+    // Immediate-offset form (tk_*_IMM): R[rn] + offset.
     EmitGuestLoad(R0, rn);
-    if (offset)
+    if (offsetReg >= 0)
+    {
+        EmitGuestLoad(R1, offsetReg);
+        EmitAddReg(R0, R0, R1, false);
+    }
+    else if (offset)
     {
         EmitLoadImm(R1, offset);
         EmitAddReg(R0, R0, R1, false);
@@ -6116,7 +6218,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitGuestLoad(R0, src);
         EmitLoadImm(R1, imm);
         EmitSubReg(R2, R0, R1, true);
-        if (tf) EmitCopyHostFlags(CPSR_NZCVMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCVMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6133,7 +6235,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitLoadImm(R1, imm);
         EmitAddReg(R2, R0, R1, true);
         EmitGuestStore(dst, R2);
-        if (tf) EmitCopyHostFlags(CPSR_NZCVMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCVMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6150,7 +6252,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitLoadImm(R1, imm);
         EmitSubReg(R2, R0, R1, true);
         EmitGuestStore(dst, R2);
-        if (tf) EmitCopyHostFlags(CPSR_NZCVMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCVMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6168,7 +6270,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitGuestLoad(R1, rhs);
         EmitAddReg(R2, R0, R1, true);
         EmitGuestStore(dst, R2);
-        if (tf) EmitCopyHostFlags(CPSR_NZCVMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCVMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6186,7 +6288,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitGuestLoad(R1, rhs);
         EmitSubReg(R2, R0, R1, true);
         EmitGuestStore(dst, R2);
-        if (tf) EmitCopyHostFlags(CPSR_NZCVMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCVMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6204,7 +6306,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitLoadImm(R1, imm);
         EmitAddReg(R2, R0, R1, true);
         EmitGuestStore(dst, R2);
-        if (tf) EmitCopyHostFlags(CPSR_NZCVMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCVMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6222,7 +6324,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitLoadImm(R1, imm);
         EmitSubReg(R2, R0, R1, true);
         EmitGuestStore(dst, R2);
-        if (tf) EmitCopyHostFlags(CPSR_NZCVMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCVMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6289,7 +6391,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitGuestLoad(R1, src);
         EmitSubReg(R2, R0, R1, true);
         EmitGuestStore(dst, R2);
-        if (tf) EmitCopyHostFlags(CPSR_NZCVMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCVMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6305,7 +6407,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitGuestLoad(R0, dst);
         EmitGuestLoad(R1, src);
         EmitSubReg(R2, R0, R1, true);
-        if (tf) EmitCopyHostFlags(CPSR_NZCVMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCVMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6321,7 +6423,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitGuestLoad(R0, dst);
         EmitGuestLoad(R1, src);
         EmitAddReg(R2, R0, R1, true);
-        if (tf) EmitCopyHostFlags(CPSR_NZCVMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCVMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6426,7 +6528,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitGuestLoad(R0, dst);
         EmitGuestLoad(R1, src);
         EmitSubReg(R2, R0, R1, true);
-        if (tf) EmitCopyHostFlags(CPSR_NZCVMask);
+        if (tf) MarkHostFlagsDirty(CPSR_NZCVMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6716,10 +6818,31 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
             return true;
         [[fallthrough]];
 
+    // M29 Phase 5: register-offset single transfers (base = R[rn] + R[rm]).  Only
+    // the non-sign-extending byte/word forms reuse the direct path; the half/sign
+    // forms (STRH/LDRSB/LDRH/LDRSH) keep the helper's ROR/sign-extend semantics.
+    // (These labels are also the fallthrough target for PUSH/POP/STMIA/LDMIA, whose
+    //  Kind is a block-transfer kind — the Kind guard skips the direct path there.)
     case ARMInstrInfo::tk_STR_REG:
     case ARMInstrInfo::tk_STRB_REG:
     case ARMInstrInfo::tk_LDR_REG:
     case ARMInstrInfo::tk_LDRB_REG:
+    {
+        const u16 k = instr.Info.Kind;
+        if (k == ARMInstrInfo::tk_STR_REG  || k == ARMInstrInfo::tk_STRB_REG
+         || k == ARMInstrInfo::tk_LDR_REG  || k == ARMInstrInfo::tk_LDRB_REG)
+        {
+            const int rd = op & 0x7;
+            const int rn = (op >> 3) & 0x7;
+            const int rm = (op >> 6) & 0x7;
+            const int  size = (k == ARMInstrInfo::tk_LDR_REG || k == ARMInstrInfo::tk_STR_REG) ? 4 : 1;
+            const bool load = (k == ARMInstrInfo::tk_LDR_REG || k == ARMInstrInfo::tk_LDRB_REG);
+            if (TryEmitThumbMemImmDirect(instr, cpu, tailReturn, rd, rn, 0, size, load, rm))
+                return true;
+        }
+    }
+    [[fallthrough]];
+
     case ARMInstrInfo::tk_STRH_REG:
     case ARMInstrInfo::tk_LDRSB_REG:
     case ARMInstrInfo::tk_LDRH_REG:
@@ -6738,14 +6861,35 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
 
     case ARMInstrInfo::tk_BCOND:
     {
-        s32 offset = (s32)(op << 24) >> 23;
-        A32BranchDesc desc;
-        desc.r15 = instr.Addr + 4;
-        desc.codeCycles = instr.CodeCycles;
-        desc.target = desc.r15 + offset + 1;
-        desc.aux = (op >> 8) & 0xF;
+        const u32 condCode = (op >> 8) & 0xF;
+        // cond 0b1110 (undefined) / 0b1111 (SWI) are not BCOND encodings and have
+        // no invertible host condition — defer to the helper if ever decoded here.
+        if (condCode >= 0xE)
+        {
+            A32BranchDesc desc;
+            desc.r15 = instr.Addr + 4;
+            desc.codeCycles = instr.CodeCycles;
+            desc.target = desc.r15 + ((s32)(op << 24) >> 23) + 1;
+            desc.aux = condCode;
+            EmitHelperCallWithDesc((const void*)&RunThumbCondBranch, &desc, sizeof(desc), tailReturn);
+            return true;
+        }
 
-        EmitHelperCallWithDesc((const void*)&RunThumbCondBranch, &desc, sizeof(desc), tailReturn);
+        // Native conditional branch — mirrors the proven conditional-BX emission.
+        // Both taken and not-taken exit the JIT block (BCOND Branches()), so this
+        // is always a tail instruction.  RunThumbCondBranch semantics:
+        //   taken     → R15 = target (Thumb), jump cycles via EmitJumpToConst
+        //   not-taken → R15 = Addr+4 (pipeline PC), AddCycles_C, return to dispatch
+        const s32 offset = (s32)(op << 24) >> 23;
+        const u32 target = (instr.Addr + 4) + (u32)offset + 1;   // +1 = Thumb bit
+
+        EmitStoreR15(instr.Addr + 4);          // not-taken pipeline PC
+        EmitLoadGuestCPSRFlags();              // seed host CPSR for the condition
+        u8* skip = EmitBranchPlaceholder(condCode ^ 1u);  // skip taken path if cond fails
+        EmitJumpToConst(cpu, target, true, true, true);   // taken: set PC + cycles + return
+        PatchBranch(skip, CodePtr);            // not-taken lands here
+        EmitAddCycles(instr, true, cpu);       // AddCycles_C equivalent
+        EmitReturn();
         return true;
     }
 
@@ -6836,6 +6980,11 @@ void Compiler::EmitHelperCallWithDesc(const void* helper, const void* desc, u32 
 {
     assert((descSize & 0x3) == 0);
 
+    // M29: spill deferred flags + dirty cached regs before the C helper reads/writes
+    // guest state.  Emitted before the r0=r4/arg setup below so its R0/R1/R3 scratch
+    // use can't clobber the call.  No-op for barrier instructions (already flushed).
+    OnHelperEmitted();
+
     if (tailReturn)
     {
         // r4 is loaded with ARM* by ARM_Dispatch and is callee-saved by AAPCS.
@@ -6912,6 +7061,12 @@ void Compiler::EmitHelperCall3(const void* helper, int arg1Reg, int arg2Reg, u32
 
 void Compiler::EmitReturn()
 {
+    // M29: returning to the dispatcher — make all deferred guest state authoritative
+    // in memory first.  Flag spill uses MRS (reads host CPSR) before anything here
+    // can clobber it; register spill is plain STRs; both are no-ops when nothing is
+    // pending (e.g. a branch whose CompileBlock barrier already flushed).
+    EmitFlushDirtyFlags();
+    FlushRegAllocForHelper();
     EmitFlushPendingCycles();
     EmitU32(0xE59FC000); // ldr ip, [pc]
     EmitU32(0xE12FFF1C); // bx ip
@@ -7441,6 +7596,11 @@ void Compiler::EmitMRS(int dst)
 // Uses R3 as scratch. Must be called before emitting any conditional instruction.
 void Compiler::EmitLoadGuestCPSRFlags()
 {
+    // M29 Phase 2: if flags are deferred, the host CPSR *already* holds the live
+    // guest NZCV (invariant), so the reseed is redundant — using host flags
+    // directly also avoids the LDR+MSR round-trip AND the matching deferred spill.
+    if (EnableLazyFlags && m_flagsDirty)
+        return;
     EmitLoadReg(R3, R4, ArmMemberOffset(&ARM::CPSR));  // R3 = guest CPSR
     EmitU32(0xE128F003);  // MSR CPSR_f, R3  — copies R3[31:24] (NZCV) into host CPSR
 }
@@ -7458,12 +7618,31 @@ void Compiler::EmitGuestLoad(int dst, int guestReg)
 
 void Compiler::EmitGuestStore(int guestReg, int src)
 {
+    // M29 Phase 1: cached → update the host reg and defer the write-back.
+    if (guestReg >= 0 && guestReg < 16 && m_rcHostReg[guestReg] != -1)
+    {
+        if (m_rcHostReg[guestReg] != src)
+            EmitMovRegShiftImm(m_rcHostReg[guestReg], src, Shift_LSL, 0, false);  // MOV (S=0)
+        m_rcDirty |= (1u << guestReg);
+        return;
+    }
     EmitStoreReg(src, R4, ArmMemberOffset(&ARM::R) + guestReg * 4);
 }
 
 // Conditional guest-register store: STR{cond} src, [R4, #guest_Rx_offset].
 void Compiler::EmitCondGuestStore(int guestReg, int src, u32 cond)
 {
+    // M29 Phase 1: cached → conditional MOV into the host reg + mark dirty.  If the
+    // condition is false at runtime the host reg keeps its current (correct) value,
+    // which the later write-back spills; marking dirty unconditionally is safe.
+    if (guestReg >= 0 && guestReg < 16 && m_rcHostReg[guestReg] != -1)
+    {
+        int hr = m_rcHostReg[guestReg];
+        if (hr != src)
+            EmitU32((cond << 28) | 0x01A00000u | ((u32)hr << 12) | (u32)src);  // MOV{cond} hr, src
+        m_rcDirty |= (1u << guestReg);
+        return;
+    }
     u32 offset = ArmMemberOffset(&ARM::R) + (u32)guestReg * 4;
     assert(offset <= 0xFFF);
     // StrImm encoding without the AL cond (strip 0xE from [31:28]) then OR in cond.
@@ -7494,6 +7673,129 @@ void Compiler::EmitCopyHostFlags(u32 mask)
     EmitStoreReg(R0, R4, ArmMemberOffset(&ARM::CPSR));
 }
 
+// ─── M29 Phase 2: lazy flag evaluation ──────────────────────────────────────
+// Replaces the eager EmitCopyHostFlags after a flag-setting ALU op.  Only the
+// full-NZCV write is deferred (the host CPSR keeps holding the live guest flags);
+// narrower writes (NZ / NZC) spill eagerly because the host CPSR's other flag
+// bits are no longer a faithful image of the guest after such an op.  The CompileBlock
+// barrier/pre-op logic guarantees any previously-pending NZCV was already spilled
+// or proven dead before this op clobbered the host flags.
+void Compiler::MarkHostFlagsDirty(u32 mask)
+{
+    if (!EnableLazyFlags || mask != CPSR_NZCVMask)
+    {
+        EmitCopyHostFlags(mask);   // eager: feature off, or partial write
+        return;
+    }
+    m_flagsDirty = true;
+    m_flagsDirtyMask = mask;
+}
+
+void Compiler::EmitFlushDirtyFlags()
+{
+    if (!m_flagsDirty)
+        return;
+    m_flagsDirty = false;
+    EmitCopyHostFlags(m_flagsDirtyMask);
+}
+
+// ─── M29 Phase 1: write-back register cache helpers ─────────────────────────
+void Compiler::SaveReg(int guestReg)
+{
+    if (guestReg < 0 || guestReg >= 16 || m_rcHostReg[guestReg] == -1)
+        return;
+    EmitStoreReg(m_rcHostReg[guestReg], R4, ArmMemberOffset(&ARM::R) + (u32)guestReg * 4);
+}
+
+void Compiler::LoadReg(int guestReg)
+{
+    if (guestReg < 0 || guestReg >= 16 || m_rcHostReg[guestReg] == -1)
+        return;
+    EmitLoadReg(m_rcHostReg[guestReg], R4, ArmMemberOffset(&ARM::R) + (u32)guestReg * 4);
+}
+
+void Compiler::FlushRegAllocForHelper()
+{
+    if (!m_rcDirty)
+        return;
+    u16 d = m_rcDirty;
+    while (d) { int g = __builtin_ctz(d); SaveReg(g); d &= d - 1; }
+    m_rcDirty = 0;
+}
+
+void Compiler::DropRegAlloc()
+{
+    memset(m_rcHostReg, -1, sizeof(m_rcHostReg));
+    m_rcDirty = 0;
+}
+
+void Compiler::OnHelperEmitted()
+{
+    // Called at the top of every helper-call emitter.  Make guest state coherent
+    // in memory before the C helper reads/writes it, and flag the register cache as
+    // poisoned (the helper may modify cpu->R[]); CompileBlock drops the mappings
+    // after the instruction.  Lazy flags are spilled so the helper sees real CPSR.
+    if (EnableLazyFlags)
+        EmitFlushDirtyFlags();
+    if (EnableRegAllocator)
+    {
+        FlushRegAllocForHelper();   // write back dirty regs so the helper sees them
+        m_rcPoison = true;          // helper may modify cpu->R[] → drop mappings after
+    }
+}
+
+// A "barrier" forces a flag spill + register-cache flush/drop before the
+// instruction.  Only straight-line pure-ALU ops that touch guest state solely via
+// EmitGuestLoad/Store + their own flag write are non-barriers; everything else
+// (memory, branch, PC write, coproc, SVC, MRS/MSR, unknown) is a barrier.
+bool Compiler::IsRegCacheBarrierKind(bool thumb, const FetchedInstr& instr)
+{
+    if (instr.Info.Branches())          // writes PC → block exit / pipeline change
+        return true;
+    const u16 k = instr.Info.Kind;
+    if (thumb)
+        return !(k < ARMInstrInfo::tk_LDR_PCREL);   // ALU range = [tk_LSL_IMM, tk_LDR_PCREL)
+    return !(k < ARMInstrInfo::ak_QADD);            // ALU/MUL range = [ak_AND.., ak_CLZ]
+}
+
+void Compiler::RegAllocPrepareBlock(bool thumb, FetchedInstr instrs[], int emitCount)
+{
+    DropRegAlloc();
+    if (!EnableRegAllocator || emitCount <= 0)
+        return;
+
+    // The cache is dropped at the first barrier, so only the leading run of
+    // cache-safe (pure-ALU) instructions benefits — measure it.
+    int prefix = 0;
+    while (prefix < emitCount && !IsRegCacheBarrierKind(thumb, instrs[prefix]))
+        prefix++;
+    if (prefix < 2)
+        return;   // not worth the block-entry LDRs
+
+    // Rank guest regs r0..r12 by use frequency within the prefix (decoder-provided
+    // SrcRegs/DstRegs cover both ARM and Thumb).  Exclude SP/LR/PC.
+    int useCount[16] = {0};
+    for (int i = 0; i < prefix; i++)
+    {
+        u16 regs = (instrs[i].Info.SrcRegs | instrs[i].Info.DstRegs) & 0x1FFF; // r0..r12
+        while (regs) { int r = __builtin_ctz(regs); useCount[r]++; regs &= regs - 1; }
+    }
+
+    static const int kCacheHostRegs[] = { R5, R6, R7, R8, R9, R10, R11 };
+    constexpr int kMax = (int)(sizeof(kCacheHostRegs) / sizeof(kCacheHostRegs[0]));
+    for (int slot = 0; slot < kMax; slot++)
+    {
+        int best = -1, bestCount = 0;
+        for (int g = 0; g < 13; g++)
+            if (m_rcHostReg[g] == -1 && useCount[g] > bestCount)
+                { best = g; bestCount = useCount[g]; }
+        if (best < 0)
+            break;
+        m_rcHostReg[best] = kCacheHostRegs[slot];
+        LoadReg(best);   // LDR cpu->R[best] → host reg (clean, not dirty)
+    }
+}
+
 void Compiler::EmitAddCycles(const FetchedInstr& instr, bool thumb, ARM* cpu)
 {
     u32 r15 = instr.Addr + (thumb ? 4 : 8);
@@ -7515,6 +7817,11 @@ void Compiler::EmitAddCyclesConst(u32 cycles)
 void Compiler::EmitJumpToConst(ARM* cpu, u32 target, bool sourceThumb,
                                bool thumbTarget, bool tailReturn)
 {
+    // M29: this rewrites the guest CPSR (T bit) and R15; spill any deferred flags
+    // first so the read-modify-write below doesn't race the pending host NZCV.
+    // No-op in practice (callers are branches, already flushed by the barrier).
+    EmitFlushDirtyFlags();
+
     u32 newPC = 0;
     u32 cycles = 0;
 

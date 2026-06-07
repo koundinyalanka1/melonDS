@@ -573,6 +573,65 @@ void RetireJitBlock(JitBlock* block)
     }
 }
 
+// M29 Phase 7: detach a live block from the SMC-tracking AddressRanges and the
+// fast lookup, without recomputing range->Code.  Leaving the Code bitmask/page
+// protection set is conservative-correct: a later guest write to that page still
+// faults into InvalidateByAddr (which rebuilds range->Code from the *surviving*
+// blocks), and a later recompile re-ORs its own mask.  The only cost is a few
+// possibly-redundant code-protection faults until the page is next touched.
+static void DetachBlockFromTracking(JitBlock* block)
+{
+    for (int j = 0; j < block->NumAddresses; j++)
+    {
+        u32 addr = block->AddressRanges()[j];
+        AddressRange* range = &CodeMemRegions[addr >> 27][(addr & 0x7FFFFFF) / 512];
+        range->Blocks.RemoveByValue(block);
+    }
+    FastBlockLookupRegions[block->StartAddrLocal >> 27]
+                          [(block->StartAddrLocal & 0x7FFFFFF) / 2] = (u64)UINT32_MAX << 32;
+}
+
+void EvictBlocksInHostCodeRange(u8* lo, u8* hi)
+{
+    auto inRange = [&](JitBlock* b) {
+        u8* ep = (u8*)b->EntryPoint;
+        return ep >= lo && ep < hi;
+    };
+
+    // Live blocks: detach from tracking + fast lookup, drop from the map, free.
+    // (delete — NOT RetireJitBlock — because the host code is about to be reused,
+    //  so the block must not linger in RestoreCandidates with a stale EntryPoint.)
+    for (auto* map : { &JitBlocks9, &JitBlocks7 })
+    {
+        for (auto it = map->begin(); it != map->end(); )
+        {
+            JitBlock* block = it->second;
+            if (inRange(block))
+            {
+                DetachBlockFromTracking(block);
+                it = map->erase(it);
+                delete block;
+            }
+            else
+                ++it;
+        }
+    }
+
+    // Retired (restore-candidate) blocks already detached from tracking when they
+    // were retired; just drop+free the ones whose code we're overwriting.
+    for (auto it = RestoreCandidates.begin(); it != RestoreCandidates.end(); )
+    {
+        JitBlock* block = it->second;
+        if (inRange(block))
+        {
+            it = RestoreCandidates.erase(it);
+            delete block;
+        }
+        else
+            ++it;
+    }
+}
+
 void CompileBlock(ARM* cpu)
 {
     bool thumb = cpu->CPSR & 0x20;
