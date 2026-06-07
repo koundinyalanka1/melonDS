@@ -69,12 +69,12 @@
 #include <windows.h>
 #endif
 #ifndef HAVE_LIBNX
-#include <GL/gl.h>
-#include <GL/glext.h>
+#include <GLES3/gl3.h>
+#include <GLES3/gl3ext.h>
 #else
 /* We need to avoid including <GL/gl.h> on this platform */
 #include "switch/nx_gl.h"
-#include <GL/glext.h>
+#include <GLES3/gl3ext.h>
 #endif /* SWITCH */
 #endif
 

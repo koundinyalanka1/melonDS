@@ -19,12 +19,16 @@
 #ifndef GPU_OPENGL_SHADERS_H
 #define GPU_OPENGL_SHADERS_H
 
-const char* kCompositorVS = R"(#version 140
+const char* kCompositorVS = R"(#version 300 es
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+precision highp usampler2D;
 
 in vec2 vPosition;
 in vec2 vTexcoord;
 
-smooth out vec2 fTexcoord;
+out vec2 fTexcoord;
 
 void main()
 {
@@ -38,32 +42,45 @@ void main()
 }
 )";
 
-const char* kCompositorFS_Nearest = R"(#version 140
+const char* kCompositorFS_Nearest = R"(#version 300 es
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+precision highp usampler2D;
 
 uniform uint u3DScale;
 uniform int u3DXPos;
 
-uniform usampler2D ScreenTex;
+uniform sampler2D ScreenTex;
+
+// Adreno GLES3 integer-texture upload workaround: CompScreenInputTex is
+// now GL_RGBA8 (normalized).  Recover the [0..255] byte values the rest
+// of the shader treats as ints.  +0.5 rounds-to-nearest so byte N
+// roundtrips exactly (N/255*255 = N-epsilon, +0.5 lands in [N..N+1)).
+ivec4 _fetchScreen(ivec2 pos, int lod)
+{
+    return ivec4(texelFetch(ScreenTex, pos, lod) * 255.0 + 0.5);
+}
 uniform sampler2D _3DTex;
 
-smooth in vec2 fTexcoord;
+in vec2 fTexcoord;
 
-out vec4 oColor;
+layout(location = 0) out vec4 oColor;
 
 void main()
 {
-    ivec4 pixel = ivec4(texelFetch(ScreenTex, ivec2(fTexcoord), 0));
+    ivec4 pixel = ivec4(_fetchScreen( ivec2(fTexcoord), 0));
 
     float _3dxpos = float(u3DXPos);
 
-    ivec4 mbright = ivec4(texelFetch(ScreenTex, ivec2(256*3, int(fTexcoord.y)), 0));
+    ivec4 mbright = ivec4(_fetchScreen( ivec2(256*3, int(fTexcoord.y)), 0));
     int dispmode = mbright.b & 0x3;
 
     if (dispmode == 1)
     {
         ivec4 val1 = pixel;
-        ivec4 val2 = ivec4(texelFetch(ScreenTex, ivec2(fTexcoord) + ivec2(256,0), 0));
-        ivec4 val3 = ivec4(texelFetch(ScreenTex, ivec2(fTexcoord) + ivec2(512,0), 0));
+        ivec4 val2 = ivec4(_fetchScreen( ivec2(fTexcoord) + ivec2(256,0), 0));
+        ivec4 val3 = ivec4(_fetchScreen( ivec2(fTexcoord) + ivec2(512,0), 0));
 
         int compmode = val3.a & 0xF;
         int eva, evb, evy;
@@ -73,9 +90,9 @@ void main()
             // 3D on top, blending
 
             float xpos = fTexcoord.x + _3dxpos;
-            float ypos = mod(fTexcoord.y, 192);
-            ivec4 _3dpix = ivec4(texelFetch(_3DTex, ivec2(vec2(xpos, ypos)*u3DScale), 0).bgra
-                         * vec4(63,63,63,31));
+            float ypos = mod(fTexcoord.y, 192.0);
+            ivec4 _3dpix = ivec4(texelFetch(_3DTex, ivec2(vec2(xpos, ypos)*float(u3DScale)), 0).bgra
+                         * vec4(63.0, 63.0, 63.0, 31.0));
 
             if (_3dpix.a > 0)
             {
@@ -94,9 +111,9 @@ void main()
             // 3D on bottom, blending
 
             float xpos = fTexcoord.x + _3dxpos;
-            float ypos = mod(fTexcoord.y, 192);
-            ivec4 _3dpix = ivec4(texelFetch(_3DTex, ivec2(vec2(xpos, ypos)*u3DScale), 0).bgra
-                         * vec4(63,63,63,31));
+            float ypos = mod(fTexcoord.y, 192.0);
+            ivec4 _3dpix = ivec4(texelFetch(_3DTex, ivec2(vec2(xpos, ypos)*float(u3DScale)), 0).bgra
+                         * vec4(63.0, 63.0, 63.0, 31.0));
 
             if (_3dpix.a > 0)
             {
@@ -114,9 +131,9 @@ void main()
             // 3D on top, normal/fade
 
             float xpos = fTexcoord.x + _3dxpos;
-            float ypos = mod(fTexcoord.y, 192);
-            ivec4 _3dpix = ivec4(texelFetch(_3DTex, ivec2(vec2(xpos, ypos)*u3DScale), 0).bgra
-                         * vec4(63,63,63,31));
+            float ypos = mod(fTexcoord.y, 192.0);
+            ivec4 _3dpix = ivec4(texelFetch(_3DTex, ivec2(vec2(xpos, ypos)*float(u3DScale)), 0).bgra
+                         * vec4(63.0, 63.0, 63.0, 31.0));
 
             if (_3dpix.a > 0)
             {
@@ -165,21 +182,34 @@ void main()
 
 
 
-const char* kCompositorFS_Linear = R"(#version 140
+const char* kCompositorFS_Linear = R"(#version 300 es
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+precision highp usampler2D;
 
 uniform uint u3DScale;
 
-uniform usampler2D ScreenTex;
+uniform sampler2D ScreenTex;
+
+// Adreno GLES3 integer-texture upload workaround: CompScreenInputTex is
+// now GL_RGBA8 (normalized).  Recover the [0..255] byte values the rest
+// of the shader treats as ints.  +0.5 rounds-to-nearest so byte N
+// roundtrips exactly (N/255*255 = N-epsilon, +0.5 lands in [N..N+1)).
+ivec4 _fetchScreen(ivec2 pos, int lod)
+{
+    return ivec4(texelFetch(ScreenTex, pos, lod) * 255.0 + 0.5);
+}
 uniform sampler2D _3DTex;
 
-smooth in vec2 fTexcoord;
+in vec2 fTexcoord;
 
-out vec4 oColor;
+layout(location = 0) out vec4 oColor;
 
 ivec4 Get3DPixel(vec2 pos)
 {
-    return ivec4(texelFetch(_3DTex, ivec2(pos*u3DScale), 0).bgra
-         * vec4(63,63,63,31));
+    return ivec4(texelFetch(_3DTex, ivec2(pos*float(u3DScale)), 0).bgra
+         * vec4(63.0, 63.0, 63.0, 31.0));
 }
 
 ivec4 GetFullPixel(ivec4 val1, ivec4 val2, ivec4 val3, ivec4 _3dpix)
@@ -239,47 +269,47 @@ ivec4 GetFullPixel(ivec4 val1, ivec4 val2, ivec4 val3, ivec4 _3dpix)
 
 ivec4 imix(ivec4 a, ivec4 b, float x)
 {
-    return ivec4(vec4(a)*(1-x) + vec4(b)*x);
+    return ivec4(vec4(a)*(1.0-x) + vec4(b)*x);
 }
 
 void main()
 {
-    ivec4 pixel = ivec4(texelFetch(ScreenTex, ivec2(fTexcoord), 0));
+    ivec4 pixel = ivec4(_fetchScreen( ivec2(fTexcoord), 0));
 
-    ivec4 mbright = ivec4(texelFetch(ScreenTex, ivec2(256*3, int(fTexcoord.y)), 0));
+    ivec4 mbright = ivec4(_fetchScreen( ivec2(256*3, int(fTexcoord.y)), 0));
     int dispmode = mbright.b & 0x3;
 
     if (dispmode == 1)
     {
         ivec4 val1 = pixel;
-        ivec4 val2 = ivec4(texelFetch(ScreenTex, ivec2(fTexcoord) + ivec2(256,0), 0));
-        ivec4 val3 = ivec4(texelFetch(ScreenTex, ivec2(fTexcoord) + ivec2(512,0), 0));
+        ivec4 val2 = ivec4(_fetchScreen( ivec2(fTexcoord) + ivec2(256,0), 0));
+        ivec4 val3 = ivec4(_fetchScreen( ivec2(fTexcoord) + ivec2(512,0), 0));
 
         float xfract = fract(fTexcoord.x);
         float yfract = fract(fTexcoord.y);
 
-        float xpos = val3.r + xfract;
-        float ypos = mod(fTexcoord.y, 192);
+        float xpos = float(val3.r) + xfract;
+        float ypos = mod(fTexcoord.y, 192.0);
         ivec4 _3dpix = Get3DPixel(vec2(xpos,ypos));
 
         ivec4 p00 = GetFullPixel(val1, val2, val3, _3dpix);
 
-        int xdisp = 1 - int(step(255, fTexcoord.x));
-        int ydisp = 1 - int(step(191, ypos));
+        int xdisp = 1 - int(step(255.0, fTexcoord.x));
+        int ydisp = 1 - int(step(191.0, ypos));
 
-        ivec4 p01 = GetFullPixel(ivec4(texelFetch(ScreenTex, ivec2(fTexcoord) + ivec2(xdisp+0  ,0), 0)),
-                                 ivec4(texelFetch(ScreenTex, ivec2(fTexcoord) + ivec2(xdisp+256,0), 0)),
-                                 ivec4(texelFetch(ScreenTex, ivec2(fTexcoord) + ivec2(xdisp+512,0), 0)),
+        ivec4 p01 = GetFullPixel(ivec4(_fetchScreen( ivec2(fTexcoord) + ivec2(xdisp+0  ,0), 0)),
+                                 ivec4(_fetchScreen( ivec2(fTexcoord) + ivec2(xdisp+256,0), 0)),
+                                 ivec4(_fetchScreen( ivec2(fTexcoord) + ivec2(xdisp+512,0), 0)),
                                  _3dpix);
 
-        ivec4 p10 = GetFullPixel(ivec4(texelFetch(ScreenTex, ivec2(fTexcoord) + ivec2(0+0  ,ydisp), 0)),
-                                 ivec4(texelFetch(ScreenTex, ivec2(fTexcoord) + ivec2(0+256,ydisp), 0)),
-                                 ivec4(texelFetch(ScreenTex, ivec2(fTexcoord) + ivec2(0+512,ydisp), 0)),
+        ivec4 p10 = GetFullPixel(ivec4(_fetchScreen( ivec2(fTexcoord) + ivec2(0+0  ,ydisp), 0)),
+                                 ivec4(_fetchScreen( ivec2(fTexcoord) + ivec2(0+256,ydisp), 0)),
+                                 ivec4(_fetchScreen( ivec2(fTexcoord) + ivec2(0+512,ydisp), 0)),
                                  _3dpix);
 
-        ivec4 p11 = GetFullPixel(ivec4(texelFetch(ScreenTex, ivec2(fTexcoord) + ivec2(xdisp+0  ,ydisp), 0)),
-                                 ivec4(texelFetch(ScreenTex, ivec2(fTexcoord) + ivec2(xdisp+256,ydisp), 0)),
-                                 ivec4(texelFetch(ScreenTex, ivec2(fTexcoord) + ivec2(xdisp+512,ydisp), 0)),
+        ivec4 p11 = GetFullPixel(ivec4(_fetchScreen( ivec2(fTexcoord) + ivec2(xdisp+0  ,ydisp), 0)),
+                                 ivec4(_fetchScreen( ivec2(fTexcoord) + ivec2(xdisp+256,ydisp), 0)),
+                                 ivec4(_fetchScreen( ivec2(fTexcoord) + ivec2(xdisp+512,ydisp), 0)),
                                  _3dpix);
 
         ivec4 pa = imix(p00, p01, xfract);
@@ -325,7 +355,11 @@ void main()
 
 // HUGE TEST ZONE ARRLGD
 
-const char* kCompositorVS_xBRZ = R"(#version 140
+const char* kCompositorVS_xBRZ = R"(#version 300 es
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+precision highp usampler2D;
 
 #define BLEND_NONE 0
 #define BLEND_NORMAL 1
@@ -386,7 +420,7 @@ void main()
     //gl_Position = MVPMatrix * VertexCoord;
     //COL0 = COLOR;
     TEX0.xy = TexCoord.xy;
-	vec2 ps = vec2(1,1);//vec2(SourceSize.z, SourceSize.w);
+	vec2 ps = vec2(1.0, 1.0);//vec2(SourceSize.z, SourceSize.w);
 	float dx = ps.x;
 	float dy = ps.y;
 
@@ -406,7 +440,11 @@ void main()
 }
 )";
 
-const char* kCompositorFS_xBRZ = R"(#version 140
+const char* kCompositorFS_xBRZ = R"(#version 300 es
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+precision highp usampler2D;
 
 #define BLEND_NONE 0
 #define BLEND_NORMAL 1
@@ -439,12 +477,21 @@ precision mediump float;
 
 uniform uint u3DScale;
 
-uniform usampler2D ScreenTex;
+uniform sampler2D ScreenTex;
+
+// Adreno GLES3 integer-texture upload workaround: CompScreenInputTex is
+// now GL_RGBA8 (normalized).  Recover the [0..255] byte values the rest
+// of the shader treats as ints.  +0.5 rounds-to-nearest so byte N
+// roundtrips exactly (N/255*255 = N-epsilon, +0.5 lands in [N..N+1)).
+ivec4 _fetchScreen(ivec2 pos, int lod)
+{
+    return ivec4(texelFetch(ScreenTex, pos, lod) * 255.0 + 0.5);
+}
 uniform sampler2D _3DTex;
 
-smooth in vec2 fTexcoord;
+in vec2 fTexcoord;
 
-out vec4 oColor;
+layout(location = 0) out vec4 oColor;
 
 //uniform COMPAT_PRECISION vec2 OutputSize;
 //uniform COMPAT_PRECISION vec2 TextureSize;
@@ -475,15 +522,15 @@ COMPAT_VARYING vec4 t7;
 
 vec4 Get2DPixel(vec2 texcoord, int level)
 {
-    ivec4 pixel = ivec4(texelFetch(ScreenTex, ivec2(texcoord) + ivec2(level*256,0), 0));
+    ivec4 pixel = ivec4(_fetchScreen( ivec2(texcoord) + ivec2(level*256,0), 0));
 
     return vec4(pixel) / vec4(63.0, 63.0, 63.0, 31.0);
 }
 
 ivec4 Get3DPixel(vec2 pos)
 {
-    return ivec4(texelFetch(_3DTex, ivec2(pos*u3DScale), 0).bgra
-         * vec4(63,63,63,31));
+    return ivec4(texelFetch(_3DTex, ivec2(pos*float(u3DScale)), 0).bgra
+         * vec4(63.0, 63.0, 63.0, 31.0));
 }
 
 float reduce(const vec3 color)
@@ -750,22 +797,22 @@ void main()
 {
     vec2 fTexcoord = vTexCoord.xy;
 
-    ivec4 pixel;// = ivec4(texelFetch(ScreenTex, ivec2(fTexcoord), 0));
+    ivec4 pixel;// = ivec4(_fetchScreen( ivec2(fTexcoord), 0));
 
-    ivec4 mbright = ivec4(texelFetch(ScreenTex, ivec2(256*3, int(fTexcoord.y)), 0));
+    ivec4 mbright = ivec4(_fetchScreen( ivec2(256*3, int(fTexcoord.y)), 0));
     int dispmode = mbright.b & 0x3;
 
     if (dispmode == 1)
     {
         ivec4 val1;// = pixel;
-        //ivec4 val2 = ivec4(texelFetch(ScreenTex, ivec2(fTexcoord) + ivec2(256,0), 0));
-        ivec4 val3 = ivec4(texelFetch(ScreenTex, ivec2(fTexcoord) + ivec2(512,0), 0));
+        //ivec4 val2 = ivec4(_fetchScreen( ivec2(fTexcoord) + ivec2(256,0), 0));
+        ivec4 val3 = ivec4(_fetchScreen( ivec2(fTexcoord) + ivec2(512,0), 0));
 
         int compmode = val3.a & 0xF;
         int eva, evb, evy;
 
         float xpos = val3.r + fract(fTexcoord.x);
-        float ypos = mod(fTexcoord.y, 192);
+        float ypos = mod(fTexcoord.y, 192.0);
         ivec4 _3dpix = Get3DPixel(vec2(xpos, ypos));
 
         if (compmode == 4)

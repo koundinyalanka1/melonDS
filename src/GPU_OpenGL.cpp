@@ -17,6 +17,24 @@
 */
 
 #include "GPU_OpenGL.h"
+#include <vector>
+#ifndef YAGE_MELONDS_GL_DIAG
+#define YAGE_MELONDS_GL_DIAG 0
+#endif
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#define MELONDS_COMP_LOGI(...) __android_log_print(ANDROID_LOG_INFO, "melonDS-GLES", __VA_ARGS__)
+#define MELONDS_COMP_LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "melonDS-GLES", __VA_ARGS__)
+#else
+#define MELONDS_COMP_LOGI(...) ((void)0)
+#define MELONDS_COMP_LOGE(...) ((void)0)
+#endif
+#if YAGE_MELONDS_GL_DIAG
+#define CHECK_COMP_FBO(idx) { GLenum s = glCheckFramebufferStatus(GL_FRAMEBUFFER); if (s != GL_FRAMEBUFFER_COMPLETE) MELONDS_COMP_LOGE("Compositor FBO Out[%d] INCOMPLETE: 0x%04x", (idx), s); else MELONDS_COMP_LOGI("Compositor FBO Out[%d] complete (0x%04x)", (idx), s); }
+#else
+#define CHECK_COMP_FBO(idx) { GLenum s = glCheckFramebufferStatus(GL_FRAMEBUFFER); if (s != GL_FRAMEBUFFER_COMPLETE) MELONDS_COMP_LOGE("Compositor FBO Out[%d] INCOMPLETE: 0x%04x", (idx), s); }
+#endif
 
 #include <cstdio>
 #include <cstring>
@@ -106,7 +124,7 @@ bool GLCompositor::Init()
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, 256*3 + 1, 192*2, 0, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256*3 + 1, 192*2, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 
     glGenTextures(2, CompScreenOutputTex);
     for (int i = 0; i < 2; i++)
@@ -154,14 +172,16 @@ void GLCompositor::SetRenderSettings(RenderSettings& settings)
         glBindTexture(GL_TEXTURE_2D, CompScreenOutputTex[i]);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
         // fill the padding
-        u8 zeroPixels[ScreenW*2*scale*4];
-        memset(zeroPixels, 0, sizeof(zeroPixels));
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 192*scale, ScreenW, 2*scale, GL_RGBA, GL_UNSIGNED_BYTE, zeroPixels);
+        std::vector<u8> zeroPixels((size_t)ScreenW * 2 * scale * 4, 0);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 192*scale, ScreenW, 2*scale, GL_RGBA, GL_UNSIGNED_BYTE, zeroPixels.data());
 
         GLenum fbassign[] = {GL_COLOR_ATTACHMENT0};
         glBindFramebuffer(GL_FRAMEBUFFER, CompScreenOutputFB[i]);
         glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, CompScreenOutputTex[i], 0);
         glDrawBuffers(1, fbassign);
+        CHECK_COMP_FBO(i);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
     }
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -208,9 +228,9 @@ void GLCompositor::RenderFrame()
 
     if (GPU::Framebuffer[frontbuf][0] && GPU::Framebuffer[frontbuf][1])
     {
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256*3 + 1, 192, GL_RGBA_INTEGER,
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256*3 + 1, 192, GL_RGBA,
                         GL_UNSIGNED_BYTE, GPU::Framebuffer[frontbuf][0]);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 192, 256*3 + 1, 192, GL_RGBA_INTEGER,
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 192, 256*3 + 1, 192, GL_RGBA,
                         GL_UNSIGNED_BYTE, GPU::Framebuffer[frontbuf][1]);
     }
 

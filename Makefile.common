@@ -92,10 +92,11 @@ INCFLAGS    += -I$(MELON_DIR)/teakra/include -I$(MELON_DIR)/teakra/src
 ifeq ($(HAVE_OPENGL), 1)
 SOURCES_C += $(CORE_DIR)/libretro-common/glsm/glsm.c \
              $(CORE_DIR)/libretro-common/glsym/rglgen.c \
-             $(CORE_DIR)/libretro-common/glsym/glsym_gl.c
+             $(CORE_DIR)/libretro-common/glsym/glsym_es3.c
 
 SOURCES_CXX +=  $(MELON_DIR)/GPU_OpenGL.cpp \
                 $(MELON_DIR)/GPU3D_OpenGL.cpp \
+                $(MELON_DIR)/GPU2D_OpenGL.cpp \
                 $(MELON_DIR)/OpenGLSupport.cpp \
                 $(CORE_DIR)/opengl.cpp
 
@@ -139,6 +140,14 @@ SOURCES_S += $(MELON_DIR)/ARMJIT_A64/ARMJIT_Linkage.S
 INCFLAGS += -I$(MELON_DIR)/ARMJIT_A64/
 
 DEFINES += -DARCHITECTURE_ARM64
+endif
+
+ifeq ($(JIT_ARCH), armv7)
+SOURCES_CXX += $(MELON_DIR)/ARMJIT_A32/ARMJIT_Compiler.cpp
+SOURCES_S += $(MELON_DIR)/ARMJIT_A32/ARMJIT_Linkage.S
+INCFLAGS += -I$(MELON_DIR)/ARMJIT_A32/
+
+DEFINES += -DARCHITECTURE_ARM
 endif
 
 ifeq ($(JIT_ARCH), x64)

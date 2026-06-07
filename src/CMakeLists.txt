@@ -109,6 +109,12 @@ if (ENABLE_JIT)
 			ARMJIT_A64/ARMJIT_Linkage.S
 		)
 	endif()
+	if (ARCHITECTURE STREQUAL ARM)
+		target_sources(core PRIVATE
+			ARMJIT_A32/ARMJIT_Compiler.cpp
+			ARMJIT_A32/ARMJIT_Linkage.S
+		)
+	endif()
 endif()
 
 add_subdirectory(teakra EXCLUDE_FROM_ALL)

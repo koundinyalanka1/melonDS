@@ -48,6 +48,10 @@
 
 #include <stdlib.h>
 
+#if defined(__arm__) && !defined(__aarch64__)
+#define ARMJIT_A32_NO_FASTMEM 1
+#endif
+
 /*
     We're handling fastmem here.
 
@@ -105,6 +109,10 @@ bool FaultHandler(FaultDescription& faultDesc);
             #define CONTEXT_PC uc_mcontext.mc_gpregs.gp_elr
         #elif defined(__NetBSD__)
             #define CONTEXT_PC uc_mcontext.__gregs[_REG_PC]
+        #endif
+    #elif defined(__arm__)
+        #if defined(__linux__)
+            #define CONTEXT_PC uc_mcontext.arm_pc
         #endif
     #endif
 #endif
@@ -697,7 +705,15 @@ const u64 AddrSpaceSize = 0x100000000;
 
 void Init()
 {
-#if defined(__SWITCH__)
+#if defined(ARMJIT_A32_NO_FASTMEM)
+    FastMem9Start = nullptr;
+    FastMem7Start = nullptr;
+    MemoryFile = -1;
+    MemoryBase = (u8*)mmap(NULL, MemoryTotalSize, PROT_READ | PROT_WRITE,
+                           MAP_ANON | MAP_PRIVATE, -1, 0);
+    assert(MemoryBase != MAP_FAILED);
+    u8* basePtr = MemoryBase;
+#elif defined(__SWITCH__)
     MemoryBase = (u8*)aligned_alloc(0x1000, MemoryTotalSize);
     virtmemLock();
     MemoryBaseCodeMem = (u8*)virtmemFindCodeMemory(MemoryTotalSize, 0x1000);
@@ -821,6 +837,8 @@ void DeInit()
     CloseHandle(MemoryFile);
 
     RemoveVectoredExceptionHandler(ExceptionHandlerHandle);
+#elif defined(ARMJIT_A32_NO_FASTMEM)
+    munmap(MemoryBase, MemoryTotalSize);
 #else
     sigaction(SIGSEGV, &OldSaSegv, nullptr);
 #ifdef __APPLE__
@@ -852,6 +870,10 @@ void Reset()
 
 bool IsFastmemCompatible(int region)
 {
+#if defined(ARMJIT_A32_NO_FASTMEM)
+    (void)region;
+    return false;
+#else
 #ifdef _WIN32
     /*
         TODO: with some hacks, the smaller shared WRAM regions
@@ -864,6 +886,7 @@ bool IsFastmemCompatible(int region)
         return false;
 #endif
     return OffsetsPerRegion[region] != UINT32_MAX;
+#endif
 }
 
 bool GetMirrorLocation(int region, u32 num, u32 addr, u32& memoryOffset, u32& mirrorStart, u32& mirrorSize)

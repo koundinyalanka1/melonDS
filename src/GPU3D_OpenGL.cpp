@@ -1,3 +1,11 @@
+// GLES3 compat shims (injected by build_libretro_cores.sh)
+#ifndef GL_UNSIGNED_SHORT_1_5_5_5_REV
+#define GL_UNSIGNED_SHORT_1_5_5_5_REV GL_UNSIGNED_SHORT_5_5_5_1
+#endif
+#ifndef GL_BGRA
+#define GL_BGRA GL_RGBA
+#endif
+
 /*
     Copyright 2016-2021 Arisotura
 
@@ -17,6 +25,23 @@
 */
 
 #include "GPU3D_OpenGL.h"
+#ifndef YAGE_MELONDS_GL_DIAG
+#define YAGE_MELONDS_GL_DIAG 0
+#endif
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#define MELONDS_3D_LOGI(...) __android_log_print(ANDROID_LOG_INFO, "melonDS-GLES", __VA_ARGS__)
+#define MELONDS_3D_LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "melonDS-GLES", __VA_ARGS__)
+#else
+#define MELONDS_3D_LOGI(...) ((void)0)
+#define MELONDS_3D_LOGE(...) ((void)0)
+#endif
+#if YAGE_MELONDS_GL_DIAG
+#define CHECK_MRT_FBO(label) { GLenum s = glCheckFramebufferStatus(GL_FRAMEBUFFER); if (s != GL_FRAMEBUFFER_COMPLETE) MELONDS_3D_LOGE("MRT FBO " label " INCOMPLETE: 0x%04x", s); else MELONDS_3D_LOGI("MRT FBO " label " complete (0x%04x)", s); }
+#else
+#define CHECK_MRT_FBO(label) { GLenum s = glCheckFramebufferStatus(GL_FRAMEBUFFER); if (s != GL_FRAMEBUFFER_COMPLETE) MELONDS_3D_LOGE("MRT FBO " label " INCOMPLETE: 0x%04x", s); }
+#endif
 
 #include <stdio.h>
 #include <string.h>
@@ -312,6 +337,7 @@ void GLRenderer::DeInit()
 
 void GLRenderer::Reset()
 {
+    FrontBuffer = 0;
 }
 
 void GLRenderer::SetRenderSettings(GPU::RenderSettings& settings)
@@ -332,12 +358,12 @@ void GLRenderer::SetRenderSettings(GPU::RenderSettings& settings)
     glBindTexture(GL_TEXTURE_2D, FramebufferTex[4]);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, ScreenW, ScreenH, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
     glBindTexture(GL_TEXTURE_2D, FramebufferTex[5]);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, ScreenW, ScreenH, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 
     glBindTexture(GL_TEXTURE_2D, FramebufferTex[6]);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, ScreenW, ScreenH, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
     glBindTexture(GL_TEXTURE_2D, FramebufferTex[7]);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, ScreenW, ScreenH, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 
     glBindFramebuffer(GL_FRAMEBUFFER, FramebufferID[3]);
     glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, FramebufferTex[3], 0);
@@ -349,12 +375,26 @@ void GLRenderer::SetRenderSettings(GPU::RenderSettings& settings)
     glFramebufferTexture(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, FramebufferTex[4], 0);
     glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, FramebufferTex[5], 0);
     glDrawBuffers(2, fbassign);
+    CHECK_MRT_FBO("FBO[0]");
 
     glBindFramebuffer(GL_FRAMEBUFFER, FramebufferID[1]);
     glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, FramebufferTex[1], 0);
     glFramebufferTexture(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, FramebufferTex[6], 0);
     glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, FramebufferTex[7], 0);
     glDrawBuffers(2, fbassign);
+    CHECK_MRT_FBO("FBO[1]");
+
+    // Clear both 3D colour output textures to transparent black. glTexImage2D
+    // with NULL leaves content undefined on GLES3; the GL 2D compositor samples
+    // FramebufferTex[FrontBuffer^1] on the very first rendered frame (before
+    // GPU3D has drawn anything), so it must see black rather than garbage.
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClearDepthf(1.0f);
+    for (int i = 0; i <= 1; i++)
+    {
+        glBindFramebuffer(GL_FRAMEBUFFER, FramebufferID[i]);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    }
 
     glBindFramebuffer(GL_FRAMEBUFFER, FramebufferID[0]);
 
@@ -1170,7 +1210,7 @@ void GLRenderer::RenderFrame()
     ShaderConfig.uFogShift = RenderFogShift;
 
     glBindBuffer(GL_UNIFORM_BUFFER, ShaderConfigUBO);
-    void* unibuf = glMapBuffer(GL_UNIFORM_BUFFER, GL_WRITE_ONLY);
+    void* unibuf = glMapBufferRange(GL_UNIFORM_BUFFER, 0, sizeof(ShaderConfig), GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
     if (unibuf) memcpy(unibuf, &ShaderConfig, sizeof(ShaderConfig));
     glUnmapBuffer(GL_UNIFORM_BUFFER);
 
@@ -1203,7 +1243,7 @@ void GLRenderer::RenderFrame()
         else if (mask & (1<<5)) vram = GPU::VRAM_F;
         else if (mask & (1<<6)) vram = GPU::VRAM_G;
 
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, i*8, 1024, 8, GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, vram);
+        { /* YAGE: NDS palette 1_5_5_5_REV -> 5_5_5_1 swizzle */ static unsigned short _yage_swizbuf[1024*8]; const unsigned short* _src = (const unsigned short*)vram; for (int _p = 0; _p < 1024*8; _p++) { unsigned short _s = _src[_p]; _yage_swizbuf[_p] = ((_s & 0x001Fu) << 11) | ((_s & 0x03E0u) << 1) | ((_s & 0x7C00u) >> 9) | ((_s >> 15) & 0x1u); } glTexSubImage2D(GL_TEXTURE_2D, 0, 0, i*8, 1024, 8, GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, _yage_swizbuf); }
     }
 
     glDisable(GL_SCISSOR_TEST);
@@ -1308,7 +1348,7 @@ u32* GLRenderer::GetLine(int line)
 
     if (line == 0)
     {
-        u8* data = (u8*)glMapBuffer(GL_PIXEL_PACK_BUFFER, GL_READ_ONLY);
+        u8* data = (u8*)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, 256*192*4, GL_MAP_READ_BIT);
         if (data) memcpy(&Framebuffer[stride*0], data, 4*stride*192);
         glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
     }
@@ -1327,7 +1367,15 @@ u32* GLRenderer::GetLine(int line)
 
 void GLRenderer::SetupAccelFrame()
 {
-    glBindTexture(GL_TEXTURE_2D, FramebufferTex[FrontBuffer]);
+    glBindTexture(GL_TEXTURE_2D, GetAccelFrameTexture());
+}
+
+GLuint GLRenderer::GetAccelFrameTexture() const
+{
+    // RenderFrame() draws into FrontBuffer, then flips it for the next draw.
+    // The completed 3D image, used by the 2D compositor as BG0, is therefore
+    // the opposite buffer. PrepareCaptureFrame() uses the same convention.
+    return FramebufferTex[FrontBuffer ^ 1];
 }
 
 }

@@ -33,6 +33,7 @@
 #include <switch/services/bsd.h>
 #endif
 
+#include <functional>
 #ifndef HAVE_WIFI
 #define SO_REUSEADDR 0
 #define SO_BROADCAST 0

@@ -26,6 +26,8 @@
 // with this enabled, to make sure it doesn't desync
 //#define DEBUG_CHECK_DESYNC
 
+class DMA; // forward declaration — DMA is in global namespace; used by NDS::DMAs
+
 namespace NDS
 {
 
@@ -210,6 +212,27 @@ extern MemRegion SWRAM_ARM7;
 
 extern u32 KeyInput;
 
+// Math hardware (divide + square-root) — accessed directly by the A32 JIT
+// IO dispatch table (M22C) to avoid the full ARM9IORead bus round-trip.
+extern u16 DivCnt;
+extern u32 DivNumerator[2];
+extern u32 DivDenominator[2];
+extern u32 DivQuotient[2];
+extern u32 DivRemainder[2];
+extern u16 SqrtCnt;
+extern u32 SqrtVal[2];
+extern u32 SqrtRes;
+void StartDiv();
+void StartSqrt();
+
+// Timer hardware — counter read + CNT write used by A32 JIT timer IO.
+u16  TimerGetCounter(u32 timer);
+void TimerStart(u32 id, u16 cnt);
+
+// DMA fill registers + key control — used by A32 JIT IO dispatch.
+extern u32 DMA9Fill[4];
+extern u16 KeyCnt;
+
 const u32 ARM7WRAMSize = 0x10000;
 extern u8* ARM7WRAM;
 
@@ -278,6 +301,7 @@ bool DMAsInMode(u32 cpu, u32 mode);
 bool DMAsRunning(u32 cpu);
 void CheckDMAs(u32 cpu, u32 mode);
 void StopDMAs(u32 cpu, u32 mode);
+extern ::DMA* DMAs[8];
 
 void RunTimers(u32 cpu);
 

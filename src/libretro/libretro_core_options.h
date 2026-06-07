@@ -201,6 +201,20 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       "disabled"
    },
    {
+      "melonds_2d_renderer",
+      "OpenGL 2D Renderer (Restart)",
+      NULL,
+      "Render the DS 2D engine (backgrounds and sprites) on the GPU instead of the CPU. Requires the OpenGL Renderer to be enabled; automatically falls back to software if the GPU/driver is unsupported.",
+      NULL,
+      "video",
+      {
+         { "software", "Software (CPU)" },
+         { "opengl",   "OpenGL (GPU)" },
+         { NULL, NULL },
+      },
+      "software"
+   },
+   {
       "melonds_opengl_resolution",
       "OpenGL Internal Resolution",
       NULL,
@@ -569,9 +583,14 @@ struct retro_core_option_v2_definition option_defs_us[] = {
          { "30", NULL },
          { "31", NULL },
          { "32", NULL },
+         { "33", NULL },
+         { "48", NULL },
+         { "64", NULL },
+         { "96", NULL },
+         { "128", NULL },
          { NULL, NULL },
       },
-      "32"
+      "128"
    },
    {
       "melonds_jit_branch_optimisations",

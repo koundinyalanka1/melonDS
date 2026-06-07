@@ -128,7 +128,7 @@ public:
 
     virtual void VBlankEnd(Unit* unitA, Unit* unitB) = 0;
 
-    void SetFramebuffer(u32* unitA, u32* unitB)
+    virtual void SetFramebuffer(u32* unitA, u32* unitB)
     {
         Framebuffer[0] = unitA;
         Framebuffer[1] = unitB;
