@@ -54,4 +54,16 @@ ifeq ($(TARGET_ARCH_ABI),armeabi-v7a)
   LOCAL_CPPFLAGS += -march=armv7-a -mtune=cortex-a53 -mfpu=neon
 endif
 
+# ── YAGE: A32 JIT instruction-kind profiler (armeabi-v7a only) ───────────────
+# Set to 1 to enable: counts native-emitted vs interpreter-fallback per
+# instruction kind, IO bucket hit rates, and direct-region chain hit rates.
+# Logs via LogA32JitProfile every ~1M events (melonDS-JIT tag).
+# Keep at 0 for shipping builds — adds ~5-10% overhead from atomic counters.
+# To enable: set A32JIT_PROFILE := 1 below, rebuild armeabi-v7a, play a 3D
+# scene for 2+ minutes, then grep logcat for "melonDS-JIT.*profile".
+A32JIT_PROFILE := 0
+ifeq ($(TARGET_ARCH_ABI),armeabi-v7a)
+  LOCAL_CPPFLAGS += -DA32JIT_PROFILE=$(A32JIT_PROFILE)
+endif
+
 include $(BUILD_SHARED_LIBRARY)

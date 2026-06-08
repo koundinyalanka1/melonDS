@@ -3761,9 +3761,22 @@ Compiler::Compiler()
     CodePtr = CodeStart;
     CodeSize = (u32)alignedSize;
 
-    A32JIT_LOGI("melonDS JIT: armeabi-v7a/AArch32 JIT backend active (Thumb ALU/mul/address native + guarded ARM ALU/mul/branch native + ARM memory helpers with direct RAM/TCM/WRAM fast path; emitted safe RAM/TCM/WRAM ARM immediate/reg/post-index byte/half/word + safe-region conditional LDM/STM + PC-in-list JumpTo returns + LDR-to-PC JumpTo branch + S+PC restore returns + Thumb LDR_PCREL/SPREL direct load/store + ARM SP MainRAM/WRAM7 speculation + block-local pcrel-base+ALU-imm propagation + M17.9 decoded unsafe single-transfer helpers with direct DS/GPU3D/DMA/Timer/Input/IRQMem/DivSqrt IO + M22C 16-byte ARM9 IO dispatch table + direct-eligible shape profiling + wide runtime direct-region single-transfer chain + decoded fallback restoration + IO/VRAM high-addr fast-exit + ARM7 BIOS7 direct loads + M18 ARM9 self-link backward-loop tail + M18 immediate B/BL fast branch exits; banked/base-in-list multiple transfers stay on helpers; unsafe misc/carry ops fallback; %d-instr straight-line blocks; conditional+carry ALU + reg-shift-by-reg + MRS/MSR_f/MUL(arm7+9)/MLA(arm7+9)/SMULL/SMLAL/UMULL/condBX/CLZ/PC-imm/PC-imm-S native; A32 profiling %s with memory reasons + M17 decoded breakdown + direct-eligible shapes + runtime-direct counters; fastmem disabled)",
+    A32JIT_LOGI("melonDS JIT: armeabi-v7a/AArch32 JIT backend active (Thumb ALU/mul/address native + guarded ARM ALU/mul/branch native + ARM memory helpers with direct RAM/TCM/WRAM fast path; emitted safe RAM/TCM/WRAM ARM immediate/reg/post-index byte/half/word + safe-region conditional LDM/STM + PC-in-list JumpTo returns + LDR-to-PC JumpTo branch + S+PC restore returns + Thumb LDR_PCREL/SPREL direct load/store + ARM SP MainRAM/WRAM7 speculation + block-local pcrel-base+ALU-imm propagation + M17.9 decoded unsafe single-transfer helpers with direct DS/GPU3D/DMA/Timer/Input/IRQMem/DivSqrt IO + M22C 16-byte ARM9 IO dispatch table + direct-eligible shape profiling + wide runtime direct-region single-transfer chain + decoded fallback restoration + IO/VRAM high-addr fast-exit + ARM7 BIOS7 direct loads + M18 ARM9 self-link backward-loop tail + M18 immediate B/BL fast branch exits + M28 Thumb imm-single/PUSH/POP/STMIA/LDMIA native + M29 Thumb tk_REG/BCOND native + M29 write-back reg-cache(R5-R11) + M29 lazy-flags + M29 4-gen code-cache + NEON MatrixMult4x4/4x3; banked/base-in-list multiple transfers stay on helpers; unsafe misc/carry ops fallback; %d-instr straight-line blocks; conditional+carry ALU + reg-shift-by-reg + MRS/MSR_f/MUL(arm7+9)/MLA(arm7+9)/SMULL/SMLAL/UMULL/condBX/CLZ/PC-imm/PC-imm-S native; A32 profiling %s with memory reasons + M17 decoded breakdown + direct-eligible shapes + runtime-direct counters; fastmem disabled)",
         Config::JIT_MaxBlockSize,
         EnableA32JitProfiling ? "on" : "off by default");
+    {
+        const char* neon =
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+            "ON";
+#else
+            "OFF";
+#endif
+        A32JIT_LOGI("M29 kill-switches: reg-alloc=%s lazy-flags=%s code-cache-wrap=%s; NEON-matrix=%s",
+            EnableRegAllocator  ? "ON" : "OFF",
+            EnableLazyFlags     ? "ON" : "OFF",
+            EnableCodeCacheWrap ? "ON" : "OFF",
+            neon);
+    }
 }
 
 Compiler::~Compiler()

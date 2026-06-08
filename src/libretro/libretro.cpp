@@ -247,7 +247,7 @@ void retro_set_environment(retro_environment_t cb)
 
 #ifdef JIT_ENABLED
 #if defined(__arm__) && !defined(__aarch64__)
-   log_cb(RETRO_LOG_INFO, "melonDS JIT: armeabi-v7a/AArch32 JIT backend active (Thumb ALU/address native slice + branch/memory helpers; 8-instr straight-line blocks; fastmem disabled)\n");
+   log_cb(RETRO_LOG_INFO, "melonDS JIT: armeabi-v7a/AArch32 backend active (M17/M18/M22C/M28/M29); feature detail and kill-switch states logged at JIT init (melonDS-JIT tag)\n");
 #elif defined(__aarch64__)
    log_cb(RETRO_LOG_INFO, "melonDS JIT: arm64-v8a/AArch64 backend active.\n");
 #elif defined(__x86_64__)
