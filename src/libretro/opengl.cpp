@@ -20,6 +20,10 @@ extern bool using_opengl;
 extern bool refresh_opengl;
 extern bool opengl_linear_filtering;
 
+// M27 (GPU2D_OpenGL.cpp): join + GPU-order the deferred worker composite
+// before the present samples the GL2D output textures.
+namespace GPU2D { void M27SyncForConsume(); }
+
 static bool initialized_glsm;
 static GLuint shader[3];
 static GLuint screen_framebuffer_texture;
@@ -53,11 +57,15 @@ static bool setup_opengl(void)
    GLuint uni_id;
 
    uni_id = glGetUniformBlockIndex(shader[2], "uConfig");
-   glUniformBlockBinding(shader[2], uni_id, 16);
+   if (uni_id != GL_INVALID_INDEX)
+      glUniformBlockBinding(shader[2], uni_id, 16);
+   CHECK_GL("glUniformBlockBinding(uConfig)");
 
    glUseProgram(shader[2]);
    uni_id = glGetUniformLocation(shader[2], "ScreenTex");
-   glUniform1i(uni_id, 0);
+   if ((GLint)uni_id >= 0)
+      glUniform1i(uni_id, 0);
+   CHECK_GL("glUniform1i(ScreenTex)");
 
    memset(&GL_ShaderConfig, 0, sizeof(GL_ShaderConfig));
 
@@ -380,6 +388,10 @@ static void remap_gl2d_triangle(float* dst, int tri, bool bottom)
 
 static bool render_gl2d_output(void)
 {
+   // M27: if the GL2D composite was deferred to the frontend's render worker,
+   // join it and order its GPU writes before we sample OutputTex below.
+   GPU2D::M27SyncForConsume();
+
    float gl2d_vertices[72] = {};
    int vertex_count = screen_layout_data.hybrid_small_screen == SmallScreenLayout::SmallScreenDuplicate ? 18 : 12;
 

@@ -43,15 +43,13 @@ LOCAL_CFLAGS   += -flto=thin -fvisibility=hidden -fno-semantic-interposition
 LOCAL_CPPFLAGS += -flto=thin -fvisibility=hidden -fvisibility-inlines-hidden -fno-semantic-interposition
 LOCAL_LDFLAGS  += -flto=thin
 
-# ── YAGE: fleet-safe 32-bit tuning for A53/A55-class Android-TV SoCs ───────
-# Use -mtune (NOT -mcpu): it schedules for the dominant in-order Cortex-A53/A55
-# WITHOUT raising the ISA above the armv7-a baseline, so the binary still runs
-# on genuine pre-ARMv8 (A7/A9) 32-bit devices. The first AArch32 JIT backend
-# is helper-call based, so these builds still benefit from interpreter-oriented
-# scheduling until native opcode coverage lands.
+# ── YAGE: CPU-neutral 32-bit ARM baseline ─────────────────────────────────
+# Keep armeabi-v7a codegen generic: no -mcpu and no -mtune for a specific
+# Cortex family.  NEON remains enabled because this core has explicit NEON
+# fast paths, but scheduling/ISA selection stays at the portable ARMv7-A level.
 ifeq ($(TARGET_ARCH_ABI),armeabi-v7a)
-  LOCAL_CFLAGS   += -march=armv7-a -mtune=cortex-a53 -mfpu=neon
-  LOCAL_CPPFLAGS += -march=armv7-a -mtune=cortex-a53 -mfpu=neon
+  LOCAL_CFLAGS   += -march=armv7-a -mfpu=neon
+  LOCAL_CPPFLAGS += -march=armv7-a -mfpu=neon
 endif
 
 # ── YAGE: A32 JIT instruction-kind profiler (armeabi-v7a only) ───────────────
@@ -59,9 +57,12 @@ endif
 # instruction kind, IO bucket hit rates, and direct-region chain hit rates.
 # Logs via LogA32JitProfile every ~1M events (melonDS-JIT tag).
 # Keep at 0 for shipping builds — adds ~5-10% overhead from atomic counters.
-# To enable: set A32JIT_PROFILE := 1 below, rebuild armeabi-v7a, play a 3D
-# scene for 2+ minutes, then grep logcat for "melonDS-JIT.*profile".
-A32JIT_PROFILE := 0
+# To enable for a local profiling build:
+#   A32JIT_PROFILE=1 FORCE_REBUILD=1 CORE_FILTER=melonds ABIS=armeabi-v7a \
+#     ./scripts/build_libretro_cores.sh
+# Then play a 3D scene for 2+ minutes and grep logcat for
+# "melonDS-JIT.*profile".
+A32JIT_PROFILE ?= 0
 ifeq ($(TARGET_ARCH_ABI),armeabi-v7a)
   LOCAL_CPPFLAGS += -DA32JIT_PROFILE=$(A32JIT_PROFILE)
 endif

@@ -559,11 +559,132 @@ InterpreterFunc InterpretTHUMB[ARMInstrInfo::tk_Count] =
 };
 #undef F
 
+// ── M31: cross-block direct-link bookkeeping (A32 backend only) ─────────────
+// Each ARM9 block whose tail is an unconditional static branch carries one
+// patchable data literal (see ARMJIT_A32 Compiler::EmitLinkTail).  This table
+// tracks every such site so links can be backpatched when the target compiles
+// and — crucially — unpatched BEFORE the target's host code is retired,
+// invalidated, evicted or its generation reused.  A stale direct branch into
+// freed/reused host code is an instant native crash; the invariant maintained
+// here is: a literal points at a block's EntryPoint ONLY while that exact
+// block is registered in JitBlocks9.
+#if defined(__arm__) && !defined(__aarch64__)
+#define A32_BLOCK_LINKING 1
+extern "C" void ARM_Ret();
+
+struct A32LinkSite
+{
+    u8*       literal;   // patchable .word inside `from`'s link tail
+    JitBlock* from;      // block owning the tail (site dies with it)
+    u32       target;    // guest block address the tail branches to
+    JitBlock* to;        // currently-linked target block, or NULL (= ARM_Ret)
+};
+static std::vector<A32LinkSite> A32LinkSites;
+static u32 g_A32LinksPatched = 0, g_A32LinksUnpatched = 0;
+
+static inline void A32LinkSiteWrite(u8* literal, u32 value)
+{
+    // The literal is data-loaded (LDR ip,[pc,#..]) — a plain u32 store is a
+    // complete, icache-free patch. Single-threaded: emu thread only.
+    memcpy(literal, &value, sizeof(value));
+}
+
+// Unpatch every site currently pointing at `block` (call whenever an ARM9
+// block leaves JitBlocks9: retire, invalidation-delete, eviction, reset).
+static void A32UnlinkBlock(JitBlock* block)
+{
+    if (block->Num != 0)
+        return;
+    for (auto& s : A32LinkSites)
+    {
+        if (s.to == block)
+        {
+            A32LinkSiteWrite(s.literal, (u32)(uintptr_t)&ARM_Ret);
+            s.to = nullptr;
+            g_A32LinksUnpatched++;
+        }
+    }
+}
+
+// Drop the sites owned by `block` (call before EVERY `delete block` — the
+// owning code may be reused afterwards, so the literal address dies with it).
+static void A32DropLinkSitesOf(JitBlock* block)
+{
+    A32UnlinkBlock(block);
+    for (size_t i = 0; i < A32LinkSites.size(); )
+    {
+        if (A32LinkSites[i].from == block)
+        {
+            A32LinkSites[i] = A32LinkSites.back();
+            A32LinkSites.pop_back();
+        }
+        else
+            i++;
+    }
+}
+
+// Backpatch all unresolved sites targeting `blockAddr` (call right after the
+// block is (re)registered in JitBlocks9 — fresh compile AND restore).
+static void A32ResolveLinksTo(u32 blockAddr, JitBlock* block)
+{
+    for (auto& s : A32LinkSites)
+    {
+        if (!s.to && s.target == blockAddr)
+        {
+            A32LinkSiteWrite(s.literal, (u32)(uintptr_t)block->EntryPoint);
+            s.to = block;
+            g_A32LinksPatched++;
+            if (g_A32LinksPatched == 1 || (g_A32LinksPatched & 0xFFF) == 0)
+                printf("melonDS A32 JIT M31 block-link ACTIVE: patched=%u unpatched=%u sites=%u\n",
+                       g_A32LinksPatched, g_A32LinksUnpatched,
+                       (u32)A32LinkSites.size());
+        }
+    }
+}
+
+// Register the freshly-compiled block's own sites and resolve them against
+// already-compiled targets.
+static void A32RegisterLinkSites(JitBlock* block)
+{
+    Compiler::LinkSiteRecord recs[4];
+    int n = JITCompiler->TakeLinkSites(recs, 4);
+    for (int i = 0; i < n; i++)
+    {
+        A32LinkSite s { recs[i].literal, block, recs[i].targetAddr, nullptr };
+        auto it = JitBlocks9.find(recs[i].targetAddr);
+        if (it != JitBlocks9.end())
+        {
+            A32LinkSiteWrite(s.literal, (u32)(uintptr_t)it->second->EntryPoint);
+            s.to = it->second;
+            g_A32LinksPatched++;
+        }
+        A32LinkSites.push_back(s);
+    }
+}
+
+static void A32ClearAllLinkSites()
+{
+    A32LinkSites.clear();
+}
+#else
+#define A32_BLOCK_LINKING 0
+static inline void A32UnlinkBlock(JitBlock*) {}
+static inline void A32DropLinkSitesOf(JitBlock*) {}
+static inline void A32ResolveLinksTo(u32, JitBlock*) {}
+static inline void A32RegisterLinkSites(JitBlock*) {}
+static inline void A32ClearAllLinkSites() {}
+#endif
+
 void RetireJitBlock(JitBlock* block)
 {
+    // M31: the block is leaving JitBlocks9 — no direct branch may target its
+    // (still-resident but logically stale) code any more.
+    A32UnlinkBlock(block);
+
     auto it = RestoreCandidates.find(block->InstrHash);
     if (it != RestoreCandidates.end())
     {
+        A32DropLinkSitesOf(it->second);   // M31: candidate object is freed
         delete it->second;
         it->second = block;
     }
@@ -610,6 +731,7 @@ void EvictBlocksInHostCodeRange(u8* lo, u8* hi)
             {
                 DetachBlockFromTracking(block);
                 it = map->erase(it);
+                A32DropLinkSitesOf(block);   // M31: unlink + drop before reuse
                 delete block;
             }
             else
@@ -625,6 +747,7 @@ void EvictBlocksInHostCodeRange(u8* lo, u8* hi)
         if (inRange(block))
         {
             it = RestoreCandidates.erase(it);
+            A32DropLinkSitesOf(block);       // M31
             delete block;
         }
         else
@@ -986,7 +1109,10 @@ void CompileBlock(ARM* cpu)
     if (!mayRestore)
     {
         if (prevBlock)
+        {
+            A32DropLinkSitesOf(prevBlock);   // M31: object freed below
             delete prevBlock;
+        }
 
         block = new JitBlock(cpu->Num, i, numAddressRanges, numLiterals);
         block->LiteralHash = literalHash;
@@ -1006,6 +1132,12 @@ void CompileBlock(ARM* cpu)
         JitEnableWrite();
         block->EntryPoint = JITCompiler->CompileBlock(cpu, thumb, instrs.data(), i, hasMemoryInstr);
         JitEnableExecute();
+
+        // M31: adopt the tail link site(s) this block emitted (ARM9 only —
+        // the compiler records none for ARM7) and patch them immediately if
+        // the target is already compiled.
+        if (cpu->Num == 0)
+            A32RegisterLinkSites(block);
 
         JIT_DEBUGPRINT("block start %p\n", block->EntryPoint);
     }
@@ -1040,6 +1172,11 @@ void CompileBlock(ARM* cpu)
     u64* entry = &FastBlockLookupRegions[(localAddr >> 27)][(localAddr & 0x7FFFFFF) / 2];
     *entry = ((u64)blockAddr | cpu->Num) << 32;
     *entry |= JITCompiler->SubEntryOffset(block->EntryPoint);
+
+    // M31: this block (fresh OR restored) is now reachable at blockAddr —
+    // backpatch every unresolved link site that targets it.
+    if (cpu->Num == 0)
+        A32ResolveLinksTo(blockAddr, block);
 }
 
 void InvalidateByAddr(u32 localAddr)
@@ -1127,10 +1264,11 @@ void InvalidateByAddr(u32 localAddr)
 
         if (!literalInvalidation)
         {
-            RetireJitBlock(block);
+            RetireJitBlock(block);   // M31: unlinks incoming sites internally
         }
         else
         {
+            A32DropLinkSitesOf(block);   // M31: object freed, sites die with it
             delete block;
         }
     }
@@ -1205,6 +1343,10 @@ template void CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWRAM_C>(u3
 void ResetBlockCache()
 {
     printf("Resetting JIT block cache...\n");
+
+    // M31: every compiled block (and thus every link literal) is about to be
+    // discarded — drop the whole site table before the deletes below.
+    A32ClearAllLinkSites();
 
     // could be replace through a function which only resets
     // the permissions but we're too lazy

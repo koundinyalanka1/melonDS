@@ -122,11 +122,17 @@ void ARMv5::UpdateDTCMSetting()
 #endif
         DTCMBase = newDTCMBase;
         DTCMSize = newDTCMSize;
+#ifdef JIT_ENABLED
+        // M31: DTCM moved/resized — rebuild the fastmem-lite page tables
+        // AFTER the new base/size are visible (the rebuild reads them).
+        ARMJIT_Memory::FastMemLiteRebuild();
+#endif
     }
 }
 
 void ARMv5::UpdateITCMSetting()
 {
+    u32 oldITCMSize = ITCMSize;
     if (CP15Control & (1<<18))
     {
         ITCMSize = 0x200 << ((ITCMSetting >> 1) & 0x1F);
@@ -137,6 +143,11 @@ void ARMv5::UpdateITCMSetting()
         ITCMSize = 0;
         //printf("ITCM disabled\n");
     }
+#ifdef JIT_ENABLED
+    // M31: ITCM window changed — fastmem-lite page coverage follows ITCMSize.
+    if (ITCMSize != oldITCMSize)
+        ARMJIT_Memory::FastMemLiteRebuild();
+#endif
 }
 
 
