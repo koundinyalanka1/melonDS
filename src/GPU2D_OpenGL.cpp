@@ -285,6 +285,10 @@ static bool GPU2D_TryLoadBinaries(const char* path, GLuint out[4])
             out[i] = glCreateProgram();
             glProgramBinary(out[i], (GLenum)fmt32, data, (GLsizei)len32);
             free(data);
+            // Adreno drivers leave GL_INVALID_OPERATION in the error queue when they
+            // reject a binary from a prior EGL context.  Drain it now so CHECK_GL
+            // calls later (e.g. glBindVertexArray) don't misattribute the stale error.
+            { GLenum _e; while ((_e = glGetError()) != GL_NO_ERROR) (void)_e; }
             GLint status = 0;
             glGetProgramiv(out[i], GL_LINK_STATUS, &status);
             if (!status) ok = false;
@@ -796,6 +800,7 @@ void GLRenderer2D::DeInitGL()
         OBJVRAMValid[u] = false;
         PrevOBJVRAMBytes[u] = 0;
     }
+    m27Renderer = nullptr;
     GLReady = false;
     GPU::GL2DActive = false;
 }

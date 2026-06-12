@@ -705,7 +705,9 @@ static void DetachBlockFromTracking(JitBlock* block)
     for (int j = 0; j < block->NumAddresses; j++)
     {
         u32 addr = block->AddressRanges()[j];
-        AddressRange* range = &CodeMemRegions[addr >> 27][(addr & 0x7FFFFFF) / 512];
+        AddressRange* region = CodeMemRegions[addr >> 27];
+        if (!region) continue;
+        AddressRange* range = &region[(addr & 0x7FFFFFF) / 512];
         range->Blocks.RemoveByValue(block);
     }
     FastBlockLookupRegions[block->StartAddrLocal >> 27]
@@ -939,7 +941,10 @@ void CompileBlock(ARM* cpu)
             u32 translatedAddr = LocaliseCodeAddress(cpu->Num, literalAddr);
             if (!translatedAddr)
             {
+                // Literal address is in non-executable memory (IO, DTCM, etc.).
+                // Storing 0 in addressRanges → NULL CodeMemRegions deref later.
                 printf("literal in non executable memory?\n");
+                goto afterLiteral;
             }
             if (InvalidLiterals.Find(translatedAddr) == -1)
             {
@@ -956,6 +961,7 @@ void CompileBlock(ARM* cpu)
                 cpu->DataRead32(literalAddr, &literalValues[numLiterals]);
                 literalLoadAddrs[numLiterals++] = translatedAddr;
             }
+            afterLiteral:;
         }
         else if (instrs[i].Info.SpecialKind == ARMInstrInfo::special_WriteMem)
             writeAddrs[numWriteAddrs++] = instrs[i].DataRegion;
@@ -1155,6 +1161,7 @@ void CompileBlock(ARM* cpu)
         assert(addressMasks[j] != 0);
 
         AddressRange* region = CodeMemRegions[addressRanges[j] >> 27];
+        if (!region) continue;  // literal in unmapped region — skip (see goto afterLiteral fix)
 
         if (!PageContainsCode(&region[(addressRanges[j] & 0x7FFF000) / 512]))
             ARMJIT_Memory::SetCodeProtection(addressRanges[j] >> 27, addressRanges[j] & 0x7FFFFFF, true);
@@ -1184,6 +1191,7 @@ void InvalidateByAddr(u32 localAddr)
     JIT_DEBUGPRINT("invalidating by addr %x\n", localAddr);
 
     AddressRange* region = CodeMemRegions[localAddr >> 27];
+    if (!region) return;
     AddressRange* range = &region[(localAddr & 0x7FFFFFF) / 512];
     u32 mask = 1 << ((localAddr & 0x1FF) / 16);
 
@@ -1367,7 +1375,9 @@ void ResetBlockCache()
         for (int j = 0; j < block->NumAddresses; j++)
         {
             u32 addr = block->AddressRanges()[j];
-            AddressRange* range = &CodeMemRegions[addr >> 27][(addr & 0x7FFFFFF) / 512];
+            AddressRange* region = CodeMemRegions[addr >> 27];
+            if (!region) continue;
+            AddressRange* range = &region[(addr & 0x7FFFFFF) / 512];
             range->Blocks.Clear();
             range->Code = 0;
         }
@@ -1379,7 +1389,9 @@ void ResetBlockCache()
         for (int j = 0; j < block->NumAddresses; j++)
         {
             u32 addr = block->AddressRanges()[j];
-            AddressRange* range = &CodeMemRegions[addr >> 27][(addr & 0x7FFFFFF) / 512];
+            AddressRange* region = CodeMemRegions[addr >> 27];
+            if (!region) continue;
+            AddressRange* range = &region[(addr & 0x7FFFFFF) / 512];
             range->Blocks.Clear();
             range->Code = 0;
         }
