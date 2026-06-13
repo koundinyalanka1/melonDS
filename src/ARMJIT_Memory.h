@@ -76,6 +76,34 @@ void SetCodeProtection(int region, u32 offset, bool protect);
 
 void* GetFuncForAddr(ARM* cpu, u32 addr, bool store, int size);
 
+/* ── M31: A32 fastmem-lite page tables ────────────────────────────────────
+ * Per-CPU, per-direction 16 KB-granule guest→host translation tables covering
+ * guest addresses [0, 0x04000000) — every direct-safe region (ITCM, DTCM,
+ * MainRAM, Shared WRAM, WRAM7, BIOS7) lives below 0x04000000; everything at or
+ * above it (IO/VRAM/...) is never direct-safe and is deflected by the JIT's
+ * existing high-address fast exit.
+ *
+ * Entry semantics: table[addr >> 14] is either 0 ("not direct — take the
+ * helper") or (hostPagePtr - guestPageBase), so the JIT computes
+ *      hostEA = entry + guestAddr
+ * with a single ADD — no masking, no per-region guards, and DTCM-overlap
+ * correctness BY CONSTRUCTION (the table is rebuilt from ClassifyAddress9/7,
+ * which resolves DTCM before MainRAM; pages straddling a non-page-aligned
+ * DTCM window are left 0).
+ *
+ * Write entries are additionally 0 for read-only regions (BIOS7) and for any
+ * page whose 16 KB contains compiled code (so SMC invalidation always runs in
+ * the helper). FastMemLiteRebuild() must be called after anything that changes
+ * the guest memory map or code protection: ARMJIT_Memory::Reset, RemapDTCM /
+ * RemapSWRAM / RemapNWRAM consumers (CP15 TCM updates, WRAMCNT writes), and
+ * SetCodeProtection transitions. Single-threaded: only the emulation thread
+ * reads or rebuilds the tables. */
+constexpr u32 kFastMemLitePageShift = 14;
+constexpr u32 kFastMemLitePages     = 0x04000000 >> kFastMemLitePageShift; // 4096
+extern u32 FastMemLiteRead[2][kFastMemLitePages];
+extern u32 FastMemLiteWrite[2][kFastMemLitePages];
+void FastMemLiteRebuild();
+
 }
 
 #endif

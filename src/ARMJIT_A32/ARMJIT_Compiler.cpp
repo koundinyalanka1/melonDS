@@ -65,7 +65,55 @@ const bool EnableThumbMemImmDirect = true;
 // there — on ARM7 a Thumb POP-PC must set bit0, which that helper clears, so ARM7
 // POP-PC stays on RunThumbMemInstr). Any guard miss falls back to the helper.
 const bool EnableThumbBlockTransfer = true;
+
+// ── M29 optimisation kill switches ───────────────────────────────────────────
+// M29 Phase 1: write-back guest-register cache (pure-ALU runs keep guest regs in
+// callee-saved host R5–R11, reads become MOV instead of LDR, writes are deferred
+// and flushed at every block-exit / helper / barrier).  Flip false to revert to
+// always reading/writing cpu->R[] in memory.
 const bool EnableRegAllocator = true;
+// M29 Phase 2: lazy (deferred) flag evaluation — a flag-setting ALU op leaves its
+// result in the host CPSR and only spills NZCV into the guest CPSR when a consumer
+// (conditional, MRS, helper, block exit) actually needs it; dead flag writes are
+// dropped.  Flip false to spill flags eagerly after every ALU op.
+const bool EnableLazyFlags = true;
+// M29 Phase 7: generational code-cache wrap-around (see ARMJIT_Compiler.h).  This
+// is the one M29 lever that touches the *shared* block manager (ARMJIT.cpp); flip
+// false to restore the original full ResetBlockCache()-when-full behaviour.
+const bool EnableCodeCacheWrap = true;
+
+// ── M31 kill switches ────────────────────────────────────────────────────────
+// M31: fastmem-lite — replaces the multi-candidate direct-region guard chain for
+// single transfers with ONE 16 KB page-table lookup (ARMJIT_Memory::FastMemLite*):
+//   addr>>14 → entry; entry==0 → helper; else host EA = entry + addr.
+// DTCM-overlap correctness and SMC store protection are baked into the tables at
+// rebuild time (see ARMJIT_Memory.h), so the emitted sequence needs no per-region
+// guards.  Runtime-gated on Config::JIT_FastMemory (melonds_jit_fast_memory).
+// Flip false to restore the M17/M28 candidate guard chains unchanged.
+const bool EnableFastMemLitePageTable = true;
+// M31: cross-block direct linking (generalised M18 self-link) — unconditional
+// static block exits jump straight to the target block's compiled entry after an
+// inline StopExecution + event-horizon check, skipping the ARM_Ret→lookup→
+// ARM_Dispatch round-trip.  Patch sites are registered per target and unpatched
+// on invalidation/eviction/cache wrap (see ARMJIT.cpp).  Flip false to always
+// return to the dispatcher between blocks.
+const bool EnableBlockLinking = true;
+// M31: keep the M29 write-back register cache LIVE across single-transfer
+// memory instructions instead of dropping it at the first one (the M29 cache
+// was prefix/loop-scoped only).  Convergence protocol per spanned memory op:
+//   1. spill deferred flags + flush dirty cached regs (guest memory becomes
+//      authoritative — the op's helper fallback path may read any guest reg);
+//   2. during the op's emission, guest-register WRITES bypass the cache and
+//      store straight to cpu->R[] (m_rcMemSpan — so the native fast path and
+//      the C helper path leave identical guest state);
+//   3. at the merge point after the op, reload every CACHED register the
+//      instruction may have written (rd / writeback rn, superset via
+//      AnalyzeArmRegUsage for ARM, exact kind decode for Thumb).
+// All other barrier kinds (LDM/STM, branches, coproc, SVC, SWP, unknown)
+// still flush+drop.  Flip false to restore the M29 drop-at-first-barrier
+// behaviour with zero other changes.
+const bool EnableRegAllocatorMemSpan = true;
+
 #ifndef A32JIT_PROFILE
 #define A32JIT_PROFILE 0
 #endif
@@ -78,6 +126,7 @@ alignas(4096) u8 JitMem[JitMemSize];
 // self-loop block — off the hot path (blocks compile once, run many times).
 u32 g_M18SelfLinkEmitted = 0;
 u32 g_M18FastBranchEmitted = 0;
+u32 g_M29CacheWrapCount = 0;   // M29 Phase 7: code-cache generational wrap events
 
 // Mirrors ARMJIT_A64/ARMJIT_Branch.cpp and CP15.cpp::kCodeCacheTiming.
 const int A32CodeCacheTiming = 3;
@@ -95,6 +144,7 @@ enum HostReg
     R8 = 8,
     R9 = 9,
     R10 = 10,
+    R11 = 11,
     R12 = 12,
 };
 
@@ -952,6 +1002,14 @@ void RunInterpreterInstr(ARM* cpu, const A32InstrDesc* desc)
     }
 
     cpu->AddCycles_C();
+}
+
+void RunArmMCRInstr(ARM* cpu, const A32InstrDesc* desc)
+{
+    cpu->R[15] = desc->r15;
+    cpu->CurInstr = desc->instr;
+    cpu->CodeCycles = desc->codeCycles;
+    ARMInterpreter::A_MCR(cpu);
 }
 
 void RunThumbBranch(ARM* cpu, const A32BranchDesc* desc)
@@ -3653,20 +3711,25 @@ static void AnalyzeArmRegUsage(u32 op, u32& read, u32& written)
         }
         else if (bit4 && bit7)
         {
-            // Halfword/signed/doubleword transfers.
-            // bits[6:5] discriminate: 01=LDRH/STRH, 10=LDRD/STRD, 11=LDRSB/LDRSH
-            const u32 sh = (op >> 5) & 3;
+            // Extra load/store: halfword/signed (LDRH/STRH/LDRSB/LDRSH) AND the
+            // ARMv5TE doublewords LDRD/STRD (present on ARM9).  op2 = bits[6:5]:
+            //   01 → halfword;  10 → LDRSB (L=1) / LDRD (L=0);  11 → LDRSH (L=1) / STRD (L=0)
             addR(rn);
             if (!bit22) addR(rm);                 // bit22=0 → register offset
-            if (sh == 2) // LDRD/STRD (ARMv5TE): operates on Rd AND Rd+1
+            const u32 op2 = (op >> 5) & 3;
+            if (!bit20 && op2 == 2)
             {
-                if (bit20) { addW(rd); if ((rd+1) < 15) addW(rd+1); }  // LDRD writes both
-                else       { addR(rd); if ((rd+1) < 15) addR(rd+1); }  // STRD reads both
+                // M29 LDRD fix: loads Rd AND Rd+1 (both written) — was wrongly
+                // analysed as a halfword store that only *reads* Rd.
+                addW(rd); addW(rd + 1);
             }
-            else
+            else if (!bit20 && op2 == 3)
             {
-                if (bit20) addW(rd); else addR(rd);   // load writes Rd, store reads it
+                // M29 STRD fix: stores (reads) Rd AND Rd+1.
+                addR(rd); addR(rd + 1);
             }
+            else if (bit20) addW(rd);             // LDRH/LDRSB/LDRSH load → writes Rd
+            else            addR(rd);             // STRH store → reads Rd
             if (!bit24 || bit21) addW(rn);        // post-index / writeback
         }
         else if (bit24 && !bit23 && !bit20)
@@ -3725,47 +3788,6 @@ static void AnalyzeArmRegUsage(u32 op, u32& read, u32& written)
     }
 }
 
-// ── Register allocator: template specializations ────────────────────────
-template <>
-const int RegisterCache<Compiler, int>::NativeRegAllocOrder[] =
-{
-    R5, R6, R7, R8, R9, R10, R11
-};
-template <>
-const int RegisterCache<Compiler, int>::NativeRegsAvailable = 7;
-
-void Compiler::LoadReg(int reg, int nativeReg)
-{
-    EmitLoadReg(nativeReg, R4, ArmMemberOffset(&ARM::R) + (u32)reg * 4);
-}
-
-void Compiler::SaveReg(int reg, int nativeReg)
-{
-    EmitStoreReg(nativeReg, R4, ArmMemberOffset(&ARM::R) + (u32)reg * 4);
-}
-
-void Compiler::FlushRegAllocForHelper()
-{
-    if (!m_useRegAlloc) return;
-    if (m_hostFlagsDirty)
-        EmitFlushDirtyFlags();
-    RegAllocCache.Flush();
-}
-
-void Compiler::MarkHostFlagsDirty(u32 mask)
-{
-    m_hostFlagsDirty = true;
-    m_dirtyFlagsMask = mask;
-}
-
-void Compiler::EmitFlushDirtyFlags()
-{
-    if (!m_hostFlagsDirty) return;
-    EmitCopyHostFlags(m_dirtyFlagsMask);
-    m_hostFlagsDirty = false;
-    m_dirtyFlagsMask = 0;
-}
-
 Compiler::Compiler()
 {
     u64 pageSize = sysconf(_SC_PAGE_SIZE);
@@ -3779,9 +3801,32 @@ Compiler::Compiler()
     CodePtr = CodeStart;
     CodeSize = (u32)alignedSize;
 
-    A32JIT_LOGI("melonDS JIT: armeabi-v7a/AArch32 JIT backend active (Thumb ALU/mul/address native + guarded ARM ALU/mul/branch native + ARM memory helpers with direct RAM/TCM/WRAM fast path; emitted safe RAM/TCM/WRAM ARM immediate/reg/post-index byte/half/word + safe-region conditional LDM/STM + PC-in-list JumpTo returns + LDR-to-PC JumpTo branch + S+PC restore returns + Thumb LDR_PCREL/SPREL direct load/store + ARM SP MainRAM/WRAM7 speculation + block-local pcrel-base+ALU-imm propagation + M17.9 decoded unsafe single-transfer helpers with direct DS/GPU3D/DMA/Timer/Input/IRQMem/DivSqrt IO + M22C 16-byte ARM9 IO dispatch table + direct-eligible shape profiling + wide runtime direct-region single-transfer chain + decoded fallback restoration + IO/VRAM high-addr fast-exit + ARM7 BIOS7 direct loads + M18 ARM9 self-link backward-loop tail + M18 immediate B/BL fast branch exits; banked/base-in-list multiple transfers stay on helpers; unsafe misc/carry ops fallback; %d-instr straight-line blocks; conditional+carry ALU + reg-shift-by-reg + MRS/MSR_f/MUL(arm7+9)/MLA(arm7+9)/SMULL/SMLAL/UMULL/condBX/CLZ/PC-imm/PC-imm-S native; A32 profiling %s with memory reasons + M17 decoded breakdown + direct-eligible shapes + runtime-direct counters; fastmem disabled)",
+    A32JIT_LOGI("melonDS A32 JIT milestones: M17/M18/M22C/M28/M29/M30/M31 active; profile=%s fastmem-lite=%s block-link=%s reg-cache-mem-span=%s",
+        EnableA32JitProfiling ? "ON" : "OFF",
+        (EnableFastMemLitePageTable && Config::JIT_FastMemory) ? "ON" : "OFF",
+        EnableBlockLinking ? "ON" : "OFF",
+        EnableRegAllocatorMemSpan ? "ON" : "OFF");
+    A32JIT_LOGI("M30 JIT: profile-safe code-cache preflight + safe MSR_IMM/MSR_REG + MCR helper active");
+    A32JIT_LOGI("M31 JIT: fastmem-lite page table + cross-block direct links + Thumb SPREL/sign-half-REG + memory-spanning reg-cache active");
+
+    A32JIT_LOGI("melonDS JIT: armeabi-v7a/AArch32 JIT backend active (Thumb ALU/mul/address native + guarded ARM ALU/mul/branch native + ARM memory helpers with direct RAM/TCM/WRAM fast path; emitted safe RAM/TCM/WRAM ARM immediate/reg/post-index byte/half/word + safe-region conditional LDM/STM + PC-in-list JumpTo returns + LDR-to-PC JumpTo branch + S+PC restore returns + Thumb LDR_PCREL/SPREL direct load/store + ARM SP MainRAM/WRAM7 speculation + block-local pcrel-base+ALU-imm propagation + M17.9 decoded unsafe single-transfer helpers with direct DS/GPU3D/DMA/Timer/Input/IRQMem/DivSqrt IO + M22C 16-byte ARM9 IO dispatch table + direct-eligible shape profiling + wide runtime direct-region single-transfer chain + decoded fallback restoration + IO/VRAM high-addr fast-exit + ARM7 BIOS7 direct loads + M18 ARM9 self-link backward-loop tail + M18 immediate B/BL fast branch exits + M28 Thumb imm-single/PUSH/POP/STMIA/LDMIA native + M29 Thumb tk_REG/BCOND native + M29 write-back reg-cache(R5-R11) + M29 lazy-flags + M29 4-gen code-cache + NEON MatrixMult4x4/4x3; banked/base-in-list multiple transfers stay on helpers; unsafe misc/carry ops fallback; %d-instr straight-line blocks; conditional+carry ALU + reg-shift-by-reg + MRS/MSR_f/MUL(arm7+9)/MLA(arm7+9)/SMULL/SMLAL/UMULL/condBX/CLZ/PC-imm/PC-imm-S native; A32 profiling %s with memory reasons + M17 decoded breakdown + direct-eligible shapes + runtime-direct counters; M31 fastmem-lite page-table %s + Thumb SPREL/sign-half-REG direct + cross-block link %s)",
         Config::JIT_MaxBlockSize,
-        EnableA32JitProfiling ? "on" : "off by default");
+        EnableA32JitProfiling ? "on" : "off by default",
+        (EnableFastMemLitePageTable && Config::JIT_FastMemory) ? "ON" : "OFF",
+        EnableBlockLinking ? "ON" : "OFF");
+    {
+        const char* neon =
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+            "ON";
+#else
+            "OFF";
+#endif
+        A32JIT_LOGI("M29 kill-switches: reg-alloc=%s lazy-flags=%s code-cache-wrap=%s; NEON-matrix=%s",
+            EnableRegAllocator  ? "ON" : "OFF",
+            EnableLazyFlags     ? "ON" : "OFF",
+            EnableCodeCacheWrap ? "ON" : "OFF",
+            neon);
+    }
 }
 
 Compiler::~Compiler()
@@ -3792,6 +3837,7 @@ void Compiler::Reset()
 {
     memset(CodeStart, 0, CodeSize);
     CodePtr = CodeStart;
+    m_curGen = 0;   // M29 Phase 7: full reset restarts at generation 0
 }
 
 bool Compiler::CanCompile(bool thumb, u16 kind)
@@ -3807,22 +3853,49 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     if (instrsCount <= 0)
         return nullptr;
 
-    // Worst-case A32 emission per guest instruction in this fork (conditional
-    // memory op with the full wide runtime-direct guard chain + decoded fallback)
-    // is ~190 bytes; 320 leaves margin. Scaling with instrsCount keeps larger
-    // blocks (Config::JIT_MaxBlockSize up to 128) from overrunning the 16 MB code
-    // buffer, and is strictly safer than the old fixed 8192 for full 32-instr blocks.
-    const u32 bytesNeeded = (u32)instrsCount * 320 + 512;
-    if (CodeSize - CodeOffset() < bytesNeeded)
+    // Worst-case A32 emission depends heavily on instrumentation: A32JIT_PROFILE
+    // inserts several counter-update sequences in the memory fast paths. Size the
+    // wrap preflight for the active build so profile cores cannot run past the
+    // current code-cache generation while emitting a large Contra-style block.
+    const u32 bytesPerInstr = EnableA32JitProfiling ? 2048 : 512;
+    const u32 fixedBytes = EnableA32JitProfiling ? 8192 : 1024;
+    const u32 bytesNeeded = (u32)instrsCount * bytesPerInstr + fixedBytes;
+
+    // M29 Phase 7: generational wrap-around.  When the current block won't fit in
+    // the current generation, advance to the next one — evicting only that
+    // generation's stale blocks and reusing its host code — instead of throwing
+    // away the entire compiled working set with a full ResetBlockCache().  Falls
+    // back to a full reset only if a single block is larger than one generation
+    // (cannot happen with the profile-aware bound above, but guarded anyway).
+    if (EnableCodeCacheWrap)
     {
-        A32JIT_LOGI("AArch32 JIT memory full, wrapping code buffer (used %u/%u bytes)...",
-                    CodeOffset(), CodeSize);
-        CodePtr = CodeStart;
-        if (CodeSize < bytesNeeded)
+        if ((u32)(GenEnd(m_curGen) - CodePtr) < bytesNeeded)
         {
-            A32JIT_LOGI("AArch32 JIT code buffer too small for block, full reset");
-            ResetBlockCache();
+            const u32 nextGen = (m_curGen + 1) % kCodeGenCount;
+            u8* lo = GenBase(nextGen);
+            u8* hi = GenEnd(nextGen);
+            if (bytesNeeded > (u32)(hi - lo))
+            {
+                A32JIT_LOGI("AArch32 JIT block too large for a generation, full reset...");
+                ResetBlockCache();   // resets CodePtr=CodeStart, m_curGen=0
+            }
+            else
+            {
+                ARMJIT::EvictBlocksInHostCodeRange(lo, hi);
+                m_curGen = nextGen;
+                CodePtr  = lo;
+                g_M29CacheWrapCount++;
+                if (g_M29CacheWrapCount == 1 || (g_M29CacheWrapCount & 0x3F) == 0)
+                    A32JIT_LOGI("melonDS A32 JIT M29 code-cache wrap ACTIVE: wraps=%u "
+                                "(now generation %u/%u)",
+                                g_M29CacheWrapCount, m_curGen, kCodeGenCount);
+            }
         }
+    }
+    else if (CodeSize - CodeOffset() < bytesNeeded)
+    {
+        A32JIT_LOGI("AArch32 JIT memory full, resetting...");
+        ResetBlockCache();
     }
 
     u8* start = CodePtr;
@@ -3834,16 +3907,18 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     // Cycle batching (6.9): reset pending cycle accumulator for this block.
     m_pendingCycles = 0;
 
-    // ── Register allocator (Phase 1) ────────────────────────────────────────
-    // Uses ARMJIT_RegisterCache.h template to dynamically map guest regs R0-R14
-    // onto host callee-saved R5-R11 across instruction boundaries.
-    // LDRD/STRD AnalyzeArmRegUsage bug is now fixed (writes Rd AND Rd+1).
-    memset(m_rcHostReg, -1, sizeof(m_rcHostReg));
-    m_useRegAlloc = EnableRegAllocator;
-    m_hostFlagsDirty = false;
-    m_dirtyFlagsMask = 0;
-    if (m_useRegAlloc)
-        RegAllocCache = RegisterCache<Compiler, int>(this, instrs, emitCount);
+    // M29 Phase 2: lazy flags start clean every block.
+    m_flagsDirty = false;
+    m_flagsDirtyMask = 0;
+
+    // M31: no link sites recorded yet for this block.
+    m_linkSiteCount = 0;
+
+    // M29 Phase 1: pick + load the write-back register cache for this block (sets
+    // m_rcHostReg / clears m_rcDirty).  The LDR preamble it emits lands *before*
+    // instrStart so the self-link loop-back skips re-loading every iteration.
+    RegAllocPrepareBlock(thumb, instrs, emitCount);
+
     // instrStart: self-link loops back here to skip the cache-load preamble.
     u8* instrStart = CodePtr;
 
@@ -3857,8 +3932,53 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
         bool forceExit = instr.Info.EndBlock || instr.Info.Branches() || instr.BranchFlags != 0;
         bool tailReturn = forceExit || i == (emitCount - 1);
 
-        if (m_useRegAlloc)
-            RegAllocCache.Prepare(thumb, i);
+        // M29 Phase 1+2 barrier / lazy-flag sync.  Done BEFORE the tail cycle-flush
+        // and tailInstrCodePtr capture so any spill code survives the self-link
+        // rewind (which rewinds CodePtr to tailInstrCodePtr).
+        bool memSpanActive = false;
+        if (EnableRegAllocator || EnableLazyFlags)
+        {
+            if (IsRegCacheBarrierKind(thumb, instr))
+            {
+                // Non-ALU op (memory/branch/CPSR/coproc/helper): make guest state
+                // authoritative before it runs, then stop caching for the rest of
+                // the block (avoids fast/fallback merge-state divergence).
+                EmitFlushDirtyFlags();
+                FlushRegAllocForHelper();
+
+                // M31: single-transfer memory ops (non-tail) can be SPANNED
+                // instead of dropping the cache: guest state is authoritative
+                // (flushed above), the op's register writes bypass the cache
+                // (m_rcMemSpan), and the written cached regs are reloaded at
+                // the merge point below — so both runtime paths converge.
+                bool haveCache = false;
+                if (EnableRegAllocator && EnableRegAllocatorMemSpan && !tailReturn)
+                    for (int g = 0; g < 16 && !haveCache; g++)
+                        haveCache = m_rcHostReg[g] != -1;
+                if (haveCache && IsMemSpanKind(thumb, instr))
+                {
+                    m_rcMemSpan  = true;
+                    memSpanActive = true;
+                }
+                else
+                    DropRegAlloc();
+            }
+            else if (EnableLazyFlags && m_flagsDirty)
+            {
+                // Pure-ALU op with deferred flags pending.  Decide whether the
+                // pending NZCV is dead (this op fully overwrites it before any read)
+                // or must be spilled to guest CPSR to survive this op.
+                const u8 wf0   =  instr.Info.WriteFlags & 0xF;          // always-written
+                const u8 wfMay = (instr.Info.WriteFlags >> 4) & 0xF;    // maybe-written
+                const u8 rf    =  instr.Info.ReadFlags & 0xF;
+                if (wf0 == 0 && wfMay == 0 && rf == 0)
+                    { /* touches no flags → S=0 host ops preserve host CPSR, keep deferring */ }
+                else if (wf0 == 0xF && rf == 0)
+                    m_flagsDirty = false;          // fully overwrites NZCV, reads none → dead
+                else
+                    EmitFlushDirtyFlags();         // partial/maybe write or flag read → spill
+            }
+        }
 
         // M18: save pointer to the start of the tail instruction's emitted code.
         // Flush accumulated cycles from all non-tail instructions here so they
@@ -3871,9 +3991,26 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
         }
 
         if (!TryEmitNative(instr, thumb, cpu, tailReturn))
-        {
-            FlushRegAllocForHelper();
             EmitInterpreterFallback(instr, thumb, tailReturn);
+
+        if (memSpanActive)
+        {
+            // M31: merge point of a spanned memory op.  Whatever runtime path
+            // executed (native fast path, decoded helper, or full interpreter
+            // fallback — all write through to cpu->R[], thanks to the bypass),
+            // reloading the written cached regs restores cache coherency, so
+            // the poison net is satisfied without dropping the mappings.
+            m_rcMemSpan = false;
+            ReloadCachedRegsWrittenBy(thumb, instr);
+            m_rcPoison = false;
+        }
+        // M29 Phase 1: if a helper ran while the cache was still live (e.g. an ALU
+        // op that fell back to the interpreter), it flushed dirty regs before the
+        // call but may have changed cpu->R[] — drop the now-stale mappings.
+        else if (m_rcPoison)
+        {
+            DropRegAlloc();
+            m_rcPoison = false;
         }
 
         // Update block-local constant-propagation state (ARM mode only).
@@ -4102,6 +4239,9 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
         if (doSelfLink && target == instrs[0].Addr && branchCycles <= 0xFF)
         {
             CodePtr = tailInstrCodePtr;
+            // M31: the rewound tail may have recorded a cross-block link site
+            // whose literal lies in the memory being reused — discard it.
+            m_linkSiteCount = 0;
             EmitSelfLinkTail(cpu, instrStart, branchCycles);
             if (EnableA32JitProfiling)
                 JitProfileCounters.SelfLinkEmitted++;
@@ -4120,14 +4260,34 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
 
 bool Compiler::IsJITFault(u8* pc)
 {
-    return pc >= CodeStart && pc < (CodeStart + CodeSize);
+    // M29 Phase 4 (FastMem foundation): a SIGSEGV originates from JIT-emitted code
+    // iff the faulting host PC lies inside our executable code buffer
+    // [CodeStart, CodeStart+CodeSize).  Faults from anywhere else (the interpreter,
+    // libretro, the renderer) are genuine crashes and must propagate.
+    //
+    // This is the gate the POSIX/Windows fault handler (ARMJIT_Memory.cpp:
+    // FaultHandler) uses to decide whether to map the faulting guest page and
+    // resume, vs. let the signal kill the process.
+    //
+    // 32-bit VA note / roadmap: a full fastmem backend would emit *unguarded* host
+    // loads/stores straight into a 4 GB guest-address-space mirror and rely on this
+    // handler to lazily map pages on first touch (RewriteMemAccess would then patch
+    // the faulting access to the guarded slow path).  On armeabi-v7a the usable
+    // user VA is only ~3 GB and fragmented, so the 4 GB+fault-mirror trick the x64
+    // backend uses isn't viable as-is; the A32 backend instead emits explicit
+    // direct-region guards (see TryEmitArmNativeMemory / the EmitDirectSafeRegion*
+    // helpers).  IsJITFault is implemented now so the handler is correct the moment
+    // a future increment starts emitting unguarded accesses; until then no emitted
+    // code faults, so this simply returns false in practice.
+    return CodeStart != nullptr && pc >= CodeStart && pc < (CodeStart + CodeSize);
 }
 
 u8* Compiler::RewriteMemAccess(u8* pc)
 {
-    // Phase 4: In fastmem mode, a faulting LDR/STR can be back-patched to a
-    // helper BL. Full back-patching requires per-instruction patch-site tracking.
-    // For now the guard-chain fallback handles the access via the fault handler.
+    // No unguarded fastmem accesses are emitted yet (see IsJITFault), so there is
+    // nothing to rewrite to a slow path.  Returning pc unchanged lets the faulting
+    // access re-execute after the handler maps the page; once real fastmem accesses
+    // exist this must patch pc's load/store to the guarded sequence.
     return pc;
 }
 
@@ -4790,8 +4950,110 @@ bool Compiler::TryEmitArmNativeMemory(const FetchedInstr& instr, ARM* cpu, bool 
             PatchBranch(regionFailBranches[i], nextCandidate);
     };
 
-    for (int i = 0; i < candidateCount; i++)
-        emitCandidate(candidates[i]);
+    // M31 fastmem-lite: one page-table lookup replaces the whole candidate
+    // guard chain.  Requires the >= 0x04000000 fast exit above (emitted when
+    // runtimeDirectCandidate) so the 4096-entry table is never over-indexed.
+    // DTCM-overlap and SMC-store protection live in the tables themselves.
+    const bool fastmemLite = EnableFastMemLitePageTable && Config::JIT_FastMemory
+                             && runtimeDirectCandidate;
+    if (fastmemLite)
+    {
+        EmitFastMemLiteLookup(cpu, !load, helperBranches, helperBranchCount);
+
+        if (load)
+        {
+            if (hasWriteback)
+            {
+                if (post)
+                {
+                    if (!immediateZeroOffset)
+                        EmitGuestStore(rn, R2);
+                }
+                else
+                {
+                    EmitGuestStore(rn, R0);
+                }
+            }
+
+            if (size == 1)
+                EmitLoadByteRegOffset(R2, R12, R0);
+            else if (size == 2)
+                EmitLoadHalfRegOffset(R2, R12, R0);
+            else
+                EmitLoadRegOffset(R2, R12, R0);
+
+            if (sign)
+            {
+                if (size == 1)
+                {
+                    EmitMovRegShiftImm(R2, R2, Shift_LSL, 24, false);
+                    EmitMovRegShiftImm(R2, R2, Shift_ASR, 24, false);
+                }
+                else if (size == 2)
+                {
+                    EmitMovRegShiftImm(R2, R2, Shift_LSL, 16, false);
+                    EmitMovRegShiftImm(R2, R2, Shift_ASR, 16, false);
+                }
+            }
+
+            if (rd == 15)
+                EmitHelperCallLoadedPC(R2, false);
+            else
+                EmitGuestStore(rd, R2);
+
+            if (EnableA32JitProfiling)
+            {
+                EmitIncrementCounter(&JitProfileCounters.DirectMemRead);
+                if (size != 4 || sign)
+                    EmitIncrementCounter(&JitProfileCounters.DirectMemNarrowRead);
+                EmitIncrementCounter(&JitProfileCounters.RuntimeDirectSingleFastpath);
+                EmitIncrementCounter(&JitProfileCounters.RuntimeDirectSingleRead);
+            }
+        }
+        else
+        {
+            EmitGuestLoad(R3, rd);          // page index in R3 is dead now
+
+            if (!post && writeback)
+                EmitGuestStore(rn, R0);
+
+            if (size == 1)
+                EmitStoreByteRegOffset(R3, R12, R0);
+            else if (size == 2)
+                EmitStoreHalfRegOffset(R3, R12, R0);
+            else
+                EmitStoreRegOffset(R3, R12, R0);
+
+            if (post && !immediateZeroOffset)
+            {
+                emitOffsetApply(R3, R0);
+                EmitGuestStore(rn, R3);
+            }
+
+            if (EnableA32JitProfiling)
+            {
+                EmitIncrementCounter(&JitProfileCounters.DirectMemWrite);
+                if (size != 4)
+                    EmitIncrementCounter(&JitProfileCounters.DirectMemNarrowWrite);
+                EmitIncrementCounter(&JitProfileCounters.RuntimeDirectSingleFastpath);
+                EmitIncrementCounter(&JitProfileCounters.RuntimeDirectSingleWrite);
+            }
+        }
+
+        EmitAddCyclesConst(ArmDirectMemoryCycles(instr, cpu, load));
+
+        if (tailReturn)
+            EmitReturn();
+        else
+            successBranches[successBranchCount++] = EmitBranchPlaceholder(Cond_AL);
+
+        hasRuntimeCandidate = true;   // miss-path profiling parity with the chain
+    }
+    else
+    {
+        for (int i = 0; i < candidateCount; i++)
+            emitCandidate(candidates[i]);
+    }
 
     u8* helperFallback = CodePtr;
     for (int i = 0; i < helperBranchCount; i++)
@@ -5204,7 +5466,8 @@ bool Compiler::TryEmitArmNative(const FetchedInstr& instr, ARM* cpu, bool tailRe
         desc.target = desc.r15 + offset;
         desc.aux = cond;
         if (cond == 0xE)
-            EmitJumpToConst(cpu, desc.target, false, false, tailReturn);
+            EmitJumpToConst(cpu, desc.target, false, false, tailReturn,
+                            /*allowLink=*/true);   // M31: unconditional static tail
         else
             EmitHelperCallWithDesc((const void*)&RunArmCondBranch,
                                    &desc, sizeof(desc), tailReturn);
@@ -5223,7 +5486,8 @@ bool Compiler::TryEmitArmNative(const FetchedInstr& instr, ARM* cpu, bool tailRe
         desc.aux = instr.Addr + 4;  // LR = address of next instruction
         EmitLoadImm(R0, desc.aux);
         EmitGuestStore(14, R0);
-        EmitJumpToConst(cpu, desc.target, false, false, tailReturn);
+        EmitJumpToConst(cpu, desc.target, false, false, tailReturn,
+                        /*allowLink=*/true);       // M31: unconditional static tail
         return true;
     }
 
@@ -5293,7 +5557,7 @@ bool Compiler::TryEmitArmNative(const FetchedInstr& instr, ARM* cpu, bool tailRe
         EmitMulReg(R2, R0, R1, mulFlagsNeeded);
         EmitGuestStore(rd, R2);
         if (mulFlagsNeeded)
-            MarkHostFlagsDirty(CPSR_NZMask);
+            EmitCopyHostFlags(CPSR_NZMask);
         // ARM9: 1/3 cycles; ARM7TDMI: worst-case 1S+4I = 5 cycles
         EmitAddCyclesConst(cpu->Num == 0 ? (setFlags ? 3 : 1) : 5);
         if (tailReturn)
@@ -5322,7 +5586,7 @@ bool Compiler::TryEmitArmNative(const FetchedInstr& instr, ARM* cpu, bool tailRe
         EmitU32(0xE0200090u | ((u32)mlaFlagsNeeded << 20) | (3u << 16) | (2u << 12) | (1u << 8) | 0u);
         EmitGuestStore(rd, R3);
         if (mlaFlagsNeeded)
-            MarkHostFlagsDirty(CPSR_NZMask);
+            EmitCopyHostFlags(CPSR_NZMask);  // MLA only updates N and Z
         // ARM9: 2/4 cycles; ARM7TDMI: 1S+(m+1)I, worst-case m=4 → 5/5 cycles
         EmitAddCyclesConst(cpu->Num == 0 ? (setFlags ? 4 : 2) : 5);
         if (tailReturn)
@@ -5355,7 +5619,7 @@ bool Compiler::TryEmitArmNative(const FetchedInstr& instr, ARM* cpu, bool tailRe
         EmitGuestStore(rdLo, R2);
         EmitGuestStore(rdHi, R3);  // stored before EmitCopyHostFlags overwrites R3 via MRS
         if (smlalFlagsNeeded)
-            MarkHostFlagsDirty(CPSR_NZMask);
+            EmitCopyHostFlags(CPSR_NZMask);  // SMLAL only updates N and Z
         EmitAddCyclesConst(setFlags ? 6 : 4);
         if (tailReturn)
             EmitReturn();
@@ -5384,7 +5648,7 @@ bool Compiler::TryEmitArmNative(const FetchedInstr& instr, ARM* cpu, bool tailRe
         EmitGuestStore(rdLo, R2);
         EmitGuestStore(rdHi, R3);
         if (smullFlagsNeeded)
-            MarkHostFlagsDirty(CPSR_NZMask);
+            EmitCopyHostFlags(CPSR_NZMask);
         EmitAddCyclesConst(setFlags ? 5 : 3);
         if (tailReturn)
             EmitReturn();
@@ -5413,8 +5677,33 @@ bool Compiler::TryEmitArmNative(const FetchedInstr& instr, ARM* cpu, bool tailRe
         EmitGuestStore(rdLo, R2);
         EmitGuestStore(rdHi, R3);
         if (umullFlagsNeeded)
-            MarkHostFlagsDirty(CPSR_NZMask);
+            EmitCopyHostFlags(CPSR_NZMask);
         EmitAddCyclesConst(setFlags ? 5 : 3);
+        if (tailReturn)
+            EmitReturn();
+        return true;
+    }
+
+    case ARMInstrInfo::ak_SMULxy:
+    {
+        // M31: SMUL<x><y> Rd, Rm, Rs — ARMv5TE 16×16 signed multiply (§13.7
+        // profile bucket).  Sets no flags (the only overflow case,
+        // -32768 × -32768 = 0x40000000, fits in 32 bits, so no Q either) and
+        // the host ARMv7 has the identical instruction.  Patch the register
+        // fields, keep the x/y half-selector bits [6:5] from the guest opword.
+        if (cond != 0xE) break;
+        u32 rd = (op >> 16) & 0xF;
+        u32 rs = (op >> 8)  & 0xF;
+        u32 rm = op & 0xF;
+        if (rd == 15 || rs == 15 || rm == 15) break;
+
+        EmitStoreR15(instr.Addr + 8);
+        EmitGuestLoad(R0, rm);
+        EmitGuestLoad(R1, rs);
+        // Patch: Rd→R2 (bits 19:16), Rs→R1 (11:8), Rm→R0 (3:0); x/y kept.
+        EmitU32((op & ~0x000FFF0Fu) | (2u << 16) | (1u << 8) | 0u);
+        EmitGuestStore(rd, R2);
+        EmitAddCycles(instr, false, cpu);
         if (tailReturn)
             EmitReturn();
         return true;
@@ -5437,26 +5726,129 @@ bool Compiler::TryEmitArmNative(const FetchedInstr& instr, ARM* cpu, bool tailRe
         return true;
     }
 
+    case ARMInstrInfo::ak_MSR_IMM:
     case ARMInstrInfo::ak_MSR_REG:
     {
-        // MSR CPSR_f, Rm — safe subset: flags-only write (field_mask=8), CPSR (R=0), cond=AL.
-        // Writes Rm[31:28] into guest CPSR[31:28] (NZCV). No mode/interrupt change.
+        // MSR CPSR_<fields>, Rm/#imm.
+        //
+        // Non-control-byte lanes (_f/_s/_x) mirror the interpreter directly: a
+        // plain masked CPSR read-modify-write (the interpreter's UpdateMode is
+        // a no-op because the mode bits can't change).
+        //
+        // M31: control-byte (_c) writes — the top interp-fallback bucket in
+        // every profiled game (IRQ enable/disable sequences: MRS / BIC|ORR
+        // #0x80 / MSR cpsr_c) — are ALSO emitted natively behind a runtime
+        // guard that proves the interpreter path would be equivalent:
+        //   • (newval ^ CPSR) & 0x3F == 0 → mode and T bits unchanged, so
+        //     UpdateMode(old, new) early-returns (ARM.cpp checks mode equality)
+        //     and the interpreter's T-bit write masking is irrelevant.
+        //   • (CPSR & 0x1F) != 0x10 → not user mode (user mode also blocks
+        //     I/F writes; the interpreter masks the whole control byte there).
+        // Any guard miss takes the inline interpreter fallback, so behaviour
+        // is bit-identical. SPSR (R=1) and conditional forms stay on the
+        // interpreter.
+        const bool isImmMsr = instr.Info.Kind == ARMInstrInfo::ak_MSR_IMM;
         if (cond != 0xE) break;
         if ((op >> 22) & 1) break;                  // R=1 → SPSR write, too complex
-        if (((op >> 16) & 0xF) != 8) break;         // field_mask != flags-only → fall back
-        u32 rm = op & 0xF;
-        if (rm == 15) break;
+        const u32 fieldMask = (op >> 16) & 0xF;
+        u32 cpsrMask = 0;
+        if (fieldMask & 0x1) cpsrMask |= 0x000000FF;
+        if (fieldMask & 0x2) cpsrMask |= 0x0000FF00;
+        if (fieldMask & 0x4) cpsrMask |= 0x00FF0000;
+        if (fieldMask & 0x8) cpsrMask |= 0xFF000000;
+        if (!cpsrMask) break;
+        cpsrMask &= 0xFFFFFFDF;                     // CPSR writes never set T (interp parity)
+        const bool controlByte = (fieldMask & 0x1) != 0;
+        const u32 rm = op & 0xF;
+        if (!isImmMsr && rm == 15) break;
 
         EmitStoreR15(instr.Addr + 8);
-        EmitGuestLoad(R1, rm);                                      // R1 = guest Rm
-        EmitLoadReg(R0, R4, ArmMemberOffset(&ARM::CPSR));           // R0 = guest CPSR
-        EmitU32(0xE3C004F0u);                                       // BIC R0, R0, #0xF0000000
-        EmitU32(0xE20114F0u);                                       // AND R1, R1, #0xF0000000
-        EmitOrrReg(R0, R0, R1);                                     // ORR R0, R0, R1
+        // R1 = new value (register or rotated immediate).
+        if (isImmMsr)
+            EmitLoadImm(R1, ROR(op & 0xFF, (op >> 7) & 0x1E));
+        else
+            EmitGuestLoad(R1, rm);
+        EmitLoadReg(R0, R4, ArmMemberOffset(&ARM::CPSR));
+
+        u8* guardBranches[2];
+        int guardBranchCount = 0;
+        if (controlByte)
+        {
+            // Guard 1: mode + T bits unchanged → (R1 ^ R0) & 0x3F == 0.
+            EmitEorReg(R2, R1, R0);
+            EmitLoadImm(R3, 0x3F);
+            EmitAndReg(R2, R2, R3);
+            EmitCmpImm(R2, 0);
+            guardBranches[guardBranchCount++] = EmitBranchPlaceholder(Cond_NE);
+            // Guard 2: not user mode → (R0 & 0x1F) != 0x10.
+            EmitLoadImm(R3, 0x1F);
+            EmitAndReg(R2, R0, R3);
+            EmitCmpImm(R2, 0x10);
+            guardBranches[guardBranchCount++] = EmitBranchPlaceholder(Cond_EQ);
+        }
+
+        EmitLoadImm(R2, cpsrMask);
+        EmitBicReg(R0, R0, R2);
+        EmitAndReg(R1, R1, R2);
+        EmitOrrReg(R0, R0, R1);
         EmitStoreReg(R0, R4, ArmMemberOffset(&ARM::CPSR));
-        EmitAddCycles(instr, false, cpu);
+
+        if (!controlByte)
+        {
+            EmitAddCycles(instr, false, cpu);
+            if (tailReturn)
+                EmitReturn();
+            return true;
+        }
+
+        // Control-byte form is dual-path at runtime: the interpreter fallback
+        // accounts its own cycles (AddCycles_C), so this instruction's cycles
+        // must be added inline on the FAST path only — m_pendingCycles is
+        // compile-time-shared between both paths and cannot be used here.
+        {
+            u32 cyc = (cpu->Num == 0)
+                ? (((instr.Addr + 8) & 0x2) ? 0 : instr.CodeCycles)
+                : NDS::ARM7MemTimings[instr.CodeCycles][3];
+            if (cyc)
+            {
+                EmitLoadReg(R2, R4, ArmMemberOffset(&ARM::Cycles));
+                EmitLoadImm(R3, cyc);
+                EmitAddReg(R2, R2, R3, false);
+                EmitStoreReg(R2, R4, ArmMemberOffset(&ARM::Cycles));
+            }
+        }
+
+        // Control-byte form: skip the fallback on the fast path, then patch
+        // the guard misses into an inline interpreter fallback.
+        u8* skipFallback = nullptr;
         if (tailReturn)
             EmitReturn();
+        else
+            skipFallback = EmitBranchPlaceholder(Cond_AL);
+
+        u8* fallback = CodePtr;
+        for (int i = 0; i < guardBranchCount; i++)
+            PatchBranch(guardBranches[i], fallback);
+        EmitInterpreterFallback(instr, false, tailReturn);
+
+        if (skipFallback)
+            PatchBranch(skipFallback, CodePtr);
+        return true;
+    }
+
+    case ARMInstrInfo::ak_MCR:
+    {
+        if (cond != 0xE)
+            break;
+
+        A32InstrDesc desc;
+        desc.instr = instr.Instr;
+        desc.r15 = instr.Addr + 8;
+        desc.codeCycles = instr.CodeCycles;
+        desc.kind = instr.Info.Kind;
+        desc.thumb = 0;
+
+        EmitHelperCallWithDesc((const void*)&RunArmMCRInstr, &desc, sizeof(desc), tailReturn);
         return true;
     }
 
@@ -5569,20 +5961,16 @@ bool Compiler::TryEmitArmNative(const FetchedInstr& instr, ARM* cpu, bool tailRe
     // Guard PC in register operand positions.
     if (!isTestLike && Rd_guest == 15)
         return false;   // writing PC triggers a branch — let interpreter handle
-    if (!isMovLike && !isTestLike && Rn_guest == 15)
-    {
-        // EmitStoreR15(instr.Addr+8) runs before any guest-register loads, so at runtime
-        // cpu->R[15] == instr.Addr+8. EmitGuestLoad(R0, 15) returns the correct pipeline PC.
-        // For setFlags=1: flags reflect (PC+8) op #imm, computed by the host ALU at runtime —
-        // no compile-time reasoning needed. Register forms (Rm=PC) still fall back.
-        if (!isImmForm)
-            return false;
-        // Fall through: both setFlags=0 and setFlags=1 immediate forms are handled correctly.
-    }
-    if (!isImmForm && Rm_guest == 15)
-        return false;
-    if (isRegShiftByReg && ((op >> 8) & 0xF) == 15)
-        return false;   // PC as shift register — unusual, let interpreter handle
+    // M31: PC as a SOURCE operand is fine for shift-by-immediate forms:
+    // EmitStoreR15(instr.Addr+8) runs before any guest-register loads, so
+    // EmitGuestLoad(Rx, 15) returns the exact pipeline PC (+8).  This covers
+    // the profiled jump-table address computations (ADD rd, pc, rm, LSL #n →
+    // ak_ADD_REG_LSL_IMM, a top interp bucket in Contra/Mario).  Only the
+    // register-specified-shift forms must still fall back: there the ARM
+    // pipeline exposes PC as +12, which the stored +8 would get wrong.
+    if (isRegShiftByReg &&
+        (Rn_guest == 15 || Rm_guest == 15 || ((op >> 8) & 0xF) == 15))
+        return false;   // PC reads as +12 with reg-shift; helper is exact
 
     EmitStoreR15(instr.Addr + 8);
 
@@ -5729,9 +6117,14 @@ bool Compiler::TryEmitArmNative(const FetchedInstr& instr, ARM* cpu, bool tailRe
 // (IO/VRAM/misaligned/unmapped). Correctness can never regress: a guard miss just
 // takes the same helper the instruction used before.
 bool Compiler::TryEmitThumbMemImmDirect(const FetchedInstr& instr, ARM* cpu, bool tailReturn,
-                                        int rd, int rn, u32 offset, int size, bool load)
+                                        int rd, int rn, u32 offset, int size, bool load,
+                                        int offsetReg, bool sign)
 {
     if (!EnableEmittedMainRAMLoadStore || !EnableThumbMemImmDirect)
+        return false;
+
+    // Sign-extending forms are stores-never; only loads reach here with sign.
+    if (sign && !load)
         return false;
 
     struct ThumbMemCandidate { int region; u32 hint; };
@@ -5778,9 +6171,15 @@ bool Compiler::TryEmitThumbMemImmDirect(const FetchedInstr& instr, ARM* cpu, boo
 
     EmitStoreR15(instr.Addr + 4);
 
-    // R0 = effective address = R[rn] + offset
+    // R0 = effective address.  Register-offset form (tk_*_REG): R[rn] + R[offsetReg].
+    // Immediate-offset form (tk_*_IMM): R[rn] + offset.
     EmitGuestLoad(R0, rn);
-    if (offset)
+    if (offsetReg >= 0)
+    {
+        EmitGuestLoad(R1, offsetReg);
+        EmitAddReg(R0, R0, R1, false);
+    }
+    else if (offset)
     {
         EmitLoadImm(R1, offset);
         EmitAddReg(R0, R0, R1, false);
@@ -5808,6 +6207,62 @@ bool Compiler::TryEmitThumbMemImmDirect(const FetchedInstr& instr, ARM* cpu, boo
     u8* successBranches[8];
     int successBranchCount = 0;
 
+    // Sign-extension of a loaded byte/half (M31: tk_LDRSB_REG / tk_LDRSH_REG).
+    auto emitSignExtendR2 = [&]()
+    {
+        if (!sign)
+            return;
+        const u32 sh = (size == 1) ? 24 : 16;
+        EmitMovRegShiftImm(R2, R2, Shift_LSL, sh, false);
+        EmitMovRegShiftImm(R2, R2, Shift_ASR, sh, false);
+    };
+
+    // M31 fastmem-lite: single page-table lookup instead of the candidate
+    // chain.  The >= 0x04000000 fast exit above guarantees the table index is
+    // in range; DTCM-overlap + SMC-store safety live in the tables.
+    if (EnableFastMemLitePageTable && Config::JIT_FastMemory)
+    {
+        EmitFastMemLiteLookup(cpu, !load, helperBranches, helperBranchCount);
+
+        if (load)
+        {
+            if (size == 1)
+                EmitLoadByteRegOffset(R2, R12, R0);
+            else if (size == 2)
+                EmitLoadHalfRegOffset(R2, R12, R0);
+            else
+                EmitLoadRegOffset(R2, R12, R0);
+            emitSignExtendR2();
+            EmitGuestStore(rd, R2);
+        }
+        else
+        {
+            EmitGuestLoad(R3, rd);      // page index in R3 is dead now
+            if (size == 1)
+                EmitStoreByteRegOffset(R3, R12, R0);
+            else if (size == 2)
+                EmitStoreHalfRegOffset(R3, R12, R0);
+            else
+                EmitStoreRegOffset(R3, R12, R0);
+        }
+
+        if (EnableA32JitProfiling)
+        {
+            EmitIncrementCounter(load ? &JitProfileCounters.DirectMemRead
+                                      : &JitProfileCounters.DirectMemWrite);
+            EmitIncrementCounter(&JitProfileCounters.RuntimeDirectSingleFastpath);
+            EmitIncrementCounter(load ? &JitProfileCounters.RuntimeDirectSingleRead
+                                      : &JitProfileCounters.RuntimeDirectSingleWrite);
+        }
+
+        EmitAddCyclesConst(ArmDirectMemoryCycles(instr, cpu, load));
+
+        if (tailReturn)
+            EmitReturn();
+        else
+            successBranches[successBranchCount++] = EmitBranchPlaceholder(Cond_AL);
+    }
+    else
     for (int c = 0; c < candidateCount; c++)
     {
         u8* regionFail[16];
@@ -5823,6 +6278,7 @@ bool Compiler::TryEmitThumbMemImmDirect(const FetchedInstr& instr, ARM* cpu, boo
                 EmitLoadHalfRegOffset(R2, R1, R12);
             else
                 EmitLoadRegOffset(R2, R1, R12);
+            emitSignExtendR2();
             EmitGuestStore(rd, R2);
         }
         else
@@ -6083,7 +6539,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitGuestLoad(R0, src);
         EmitMovRegShiftImm(R2, R0, Shift_LSL, shift, true);
         EmitGuestStore(dst, R2);
-        if (tf) MarkHostFlagsDirty(shift ? CPSR_NZCMask : CPSR_NZMask);
+        if (tf) EmitCopyHostFlags(shift ? CPSR_NZCMask : CPSR_NZMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6100,7 +6556,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitGuestLoad(R0, src);
         EmitMovRegShiftImm(R2, R0, Shift_LSR, shift, true);
         EmitGuestStore(dst, R2);
-        if (tf) MarkHostFlagsDirty(CPSR_NZCMask);
+        if (tf) EmitCopyHostFlags(CPSR_NZCMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6117,7 +6573,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitGuestLoad(R0, src);
         EmitMovRegShiftImm(R2, R0, Shift_ASR, shift, true);
         EmitGuestStore(dst, R2);
-        if (tf) MarkHostFlagsDirty(CPSR_NZCMask);
+        if (tf) EmitCopyHostFlags(CPSR_NZCMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6133,7 +6589,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitLoadImm(R2, imm);
         EmitGuestStore(dst, R2);
         EmitCmpImm(R2, 0);
-        if (tf) MarkHostFlagsDirty(CPSR_NZMask);
+        if (tf) EmitCopyHostFlags(CPSR_NZMask);
         EmitAddCycles(instr, true, cpu);
         if (tailReturn)
             EmitReturn();
@@ -6391,7 +6847,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         EmitGuestLoad(R1, src);
         EmitMulReg(R2, R0, R1, true);
         EmitGuestStore(dst, R2);
-        if (tf) MarkHostFlagsDirty(CPSR_NZMask);
+        if (tf) EmitCopyHostFlags(CPSR_NZMask);
         EmitAddCyclesConst(3);
         if (tailReturn)
             EmitReturn();
@@ -6587,73 +7043,22 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
     }
 
     case ARMInstrInfo::tk_LDR_SPREL:
-    {
-        // LDR Rd, [SP, #imm8*4] — word load from SP + (op&0xFF)<<2.
-        // ARM9: speculate SP is in MainRAM (actual DS game stacks live at 0x02XXXXXX).
-        // ARM7: speculate SP is in WRAM7 (0x03800000).
-        // Runtime guard falls through to RunThumbMemInstr if SP is elsewhere.
-        const u32 rd = (op >> 8) & 0x7;
-        const u32 imm = (op & 0xFF) << 2;
-
-        A32InstrDesc desc;
-        desc.instr = instr.Instr;
-        desc.r15 = instr.Addr + 4;
-        desc.codeCycles = instr.CodeCycles;
-        desc.kind = instr.Info.Kind;
-        desc.thumb = 1;
-
-        const int region = cpu->Num == 0
-            ? ARMJIT_Memory::memregion_MainRAM
-            : ARMJIT_Memory::memregion_WRAM7;
-        const u32 regionHint = cpu->Num == 0 ? 0x02000000u : 0x03800000u;
-
-        if (!IsDirectSafeDataRegion(cpu, region, regionHint))
-        {
-            EmitHelperCallWithDesc((const void*)&RunThumbMemInstr, &desc, sizeof(desc), tailReturn);
-            return true;
-        }
-
-        u8* fallbackBranches[8];
-        int fallbackBranchCount = 0;
-
-        EmitStoreR15(instr.Addr + 4);
-        EmitGuestLoad(R0, 13);
-        if (imm)
-        {
-            EmitLoadImm(R1, imm);
-            EmitAddReg(R0, R0, R1, false);
-        }
-
-        EmitDirectSafeRegionSetup(region, cpu, regionHint, R0, R12, R1, 4,
-                                  fallbackBranches, fallbackBranchCount);
-        EmitLoadRegOffset(R2, R1, R12);
-        EmitGuestStore(rd, R2);
-        EmitAddCyclesConst(ArmDirectMemoryCycles(instr, cpu, true));
-
-        u8* skipFallback = nullptr;
-        if (tailReturn)
-            EmitReturn();
-        else
-            skipFallback = EmitBranchPlaceholder(Cond_AL);
-
-        u8* fallback = CodePtr;
-        for (int i = 0; i < fallbackBranchCount; i++)
-            PatchBranch(fallbackBranches[i], fallback);
-
-        EmitHelperCallWithDesc((const void*)&RunThumbMemInstr, &desc, sizeof(desc), tailReturn);
-
-        if (skipFallback)
-            PatchBranch(skipFallback, CodePtr);
-
-        return true;
-    }
-
     case ARMInstrInfo::tk_STR_SPREL:
     {
-        // STR Rd, [SP, #imm8*4] — word store to SP + (op&0xFF)<<2.
-        // Same SP speculation as LDR_SPREL: MainRAM for ARM9, WRAM7 for ARM7.
-        const u32 rd = (op >> 8) & 0x7;
-        const u32 imm = (op & 0xFF) << 2;
+        // LDR/STR Rd, [SP, #imm8*4].  M31: routed through the generic direct
+        // single-transfer path (rn = SP) — with fastmem-lite enabled this is a
+        // page-table hit for MainRAM *and* DTCM stacks (Nintendo-SDK games keep
+        // the ARM9 stack in DTCM at 0x027CXXXX; the old MainRAM-only
+        // speculation guard-missed those to the helper on every access, the
+        // top Thumb mem-helper bucket in the Pokemon profile).  With
+        // fastmem-lite off, the candidate chain still covers DTCM first.
+        const u32 rdSp = (op >> 8) & 0x7;
+        const u32 immSp = (op & 0xFF) << 2;
+        const bool loadSp = instr.Info.Kind == ARMInstrInfo::tk_LDR_SPREL;
+
+        if (TryEmitThumbMemImmDirect(instr, cpu, tailReturn, (int)rdSp, 13, immSp,
+                                     4, loadSp))
+            return true;
 
         A32InstrDesc desc;
         desc.instr = instr.Instr;
@@ -6662,52 +7067,7 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         desc.kind = instr.Info.Kind;
         desc.thumb = 1;
 
-        const int region = cpu->Num == 0
-            ? ARMJIT_Memory::memregion_MainRAM
-            : ARMJIT_Memory::memregion_WRAM7;
-        const u32 regionHint = cpu->Num == 0 ? 0x02000000u : 0x03800000u;
-
-        if (!IsDirectSafeDataRegion(cpu, region, regionHint))
-        {
-            EmitHelperCallWithDesc((const void*)&RunThumbMemInstr, &desc, sizeof(desc), tailReturn);
-            return true;
-        }
-
-        u8* fallbackBranches[8];
-        int fallbackBranchCount = 0;
-
-        EmitStoreR15(instr.Addr + 4);
-        EmitGuestLoad(R0, 13);
-        if (imm)
-        {
-            EmitLoadImm(R1, imm);
-            EmitAddReg(R0, R0, R1, false);
-        }
-
-        EmitDirectSafeRegionSetup(region, cpu, regionHint, R0, R2, R1, 4,
-                                  fallbackBranches, fallbackBranchCount);
-        EmitCodeBitmapGuard(region, R2, fallbackBranches, fallbackBranchCount);
-        EmitDirectSafeRegionBase(region, cpu, R1);
-
-        EmitGuestLoad(R3, rd);
-        EmitStoreRegOffset(R3, R1, R2);
-        EmitAddCyclesConst(ArmDirectMemoryCycles(instr, cpu, false));
-
-        u8* skipFallback = nullptr;
-        if (tailReturn)
-            EmitReturn();
-        else
-            skipFallback = EmitBranchPlaceholder(Cond_AL);
-
-        u8* fallback = CodePtr;
-        for (int i = 0; i < fallbackBranchCount; i++)
-            PatchBranch(fallbackBranches[i], fallback);
-
         EmitHelperCallWithDesc((const void*)&RunThumbMemInstr, &desc, sizeof(desc), tailReturn);
-
-        if (skipFallback)
-            PatchBranch(skipFallback, CodePtr);
-
         return true;
     }
 
@@ -6749,37 +7109,57 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
             return true;
         [[fallthrough]];
 
+    // M29 Phase 5: register-offset single transfers (base = R[rn] + R[rm]).  Only
+    // the non-sign-extending byte/word forms reuse the direct path; the half/sign
+    // forms (STRH/LDRSB/LDRH/LDRSH) keep the helper's ROR/sign-extend semantics.
+    // (These labels are also the fallthrough target for PUSH/POP/STMIA/LDMIA, whose
+    //  Kind is a block-transfer kind — the Kind guard skips the direct path there.)
     case ARMInstrInfo::tk_STR_REG:
     case ARMInstrInfo::tk_STRB_REG:
     case ARMInstrInfo::tk_LDR_REG:
     case ARMInstrInfo::tk_LDRB_REG:
     {
-        if (EnableThumbMemImmDirect)
+        const u16 k = instr.Info.Kind;
+        if (k == ARMInstrInfo::tk_STR_REG  || k == ARMInstrInfo::tk_STRB_REG
+         || k == ARMInstrInfo::tk_LDR_REG  || k == ARMInstrInfo::tk_LDRB_REG)
         {
-            const u32 rd = op & 0x7;
-            const u32 rn = (op >> 3) & 0x7;
-            const u32 rm = (op >> 6) & 0x7;
-            bool isLoad = (instr.Info.Kind == ARMInstrInfo::tk_LDR_REG ||
-                           instr.Info.Kind == ARMInstrInfo::tk_LDRB_REG);
-            int size = (instr.Info.Kind == ARMInstrInfo::tk_LDRB_REG ||
-                        instr.Info.Kind == ARMInstrInfo::tk_STRB_REG) ? 1 : 4;
-
-            EmitStoreR15(instr.Addr + 4);
-            EmitGuestLoad(R0, rn);
-            EmitGuestLoad(R1, rm);
-            EmitAddReg(R0, R0, R1, false);
-            if (TryEmitThumbMemImmDirect(instr, cpu, tailReturn, rd, rn, 0, size, isLoad))
+            const int rd = op & 0x7;
+            const int rn = (op >> 3) & 0x7;
+            const int rm = (op >> 6) & 0x7;
+            const int  size = (k == ARMInstrInfo::tk_LDR_REG || k == ARMInstrInfo::tk_STR_REG) ? 4 : 1;
+            const bool load = (k == ARMInstrInfo::tk_LDR_REG || k == ARMInstrInfo::tk_LDRB_REG);
+            if (TryEmitThumbMemImmDirect(instr, cpu, tailReturn, rd, rn, 0, size, load, rm))
                 return true;
         }
-        goto thumb_reg_mem_fallback;
     }
+    [[fallthrough]];
 
     case ARMInstrInfo::tk_STRH_REG:
     case ARMInstrInfo::tk_LDRSB_REG:
     case ARMInstrInfo::tk_LDRH_REG:
     case ARMInstrInfo::tk_LDRSH_REG:
-    thumb_reg_mem_fallback:
     {
+        // M31: sign/half register-offset forms now use the direct path too
+        // (profile evidence: tk_LDRH_REG was a top Thumb mem-helper bucket).
+        // The alignment guard keeps the hardware's misaligned ROR / LDRSH
+        // special cases on the helper; aligned accesses are plain loads/stores
+        // (+ sign extension for LDRSB/LDRSH).
+        const u16 k2 = instr.Info.Kind;
+        if (k2 == ARMInstrInfo::tk_STRH_REG  || k2 == ARMInstrInfo::tk_LDRSB_REG ||
+            k2 == ARMInstrInfo::tk_LDRH_REG  || k2 == ARMInstrInfo::tk_LDRSH_REG)
+        {
+            const int rd = op & 0x7;
+            const int rn = (op >> 3) & 0x7;
+            const int rm = (op >> 6) & 0x7;
+            const int  size = (k2 == ARMInstrInfo::tk_LDRSB_REG) ? 1 : 2;
+            const bool load = (k2 != ARMInstrInfo::tk_STRH_REG);
+            const bool sign = (k2 == ARMInstrInfo::tk_LDRSB_REG ||
+                               k2 == ARMInstrInfo::tk_LDRSH_REG);
+            if (TryEmitThumbMemImmDirect(instr, cpu, tailReturn, rd, rn, 0, size, load,
+                                         rm, sign))
+                return true;
+        }
+
         A32InstrDesc desc;
         desc.instr = instr.Instr;
         desc.r15 = instr.Addr + 4;
@@ -6793,32 +7173,35 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
 
     case ARMInstrInfo::tk_BCOND:
     {
-        const s32 offset = (s32)(op << 24) >> 23;
-        const u32 cond = (op >> 8) & 0xF;
-        const u32 r15 = instr.Addr + 4;
-        const u32 target = r15 + (u32)offset;
-
-        if (cond < 0xE)
+        const u32 condCode = (op >> 8) & 0xF;
+        // cond 0b1110 (undefined) / 0b1111 (SWI) are not BCOND encodings and have
+        // no invertible host condition — defer to the helper if ever decoded here.
+        if (condCode >= 0xE)
         {
-            EmitStoreR15(r15);
-            EmitLoadGuestCPSRFlags();
-            EmitAddCycles(instr, true, cpu);
-
-            u8* condBranch = EmitBranchPlaceholder(cond);
-            EmitReturn();
-
-            PatchBranch(condBranch, CodePtr);
-            EmitJumpToConst(cpu, target, true, true, tailReturn);
+            A32BranchDesc desc;
+            desc.r15 = instr.Addr + 4;
+            desc.codeCycles = instr.CodeCycles;
+            desc.target = desc.r15 + ((s32)(op << 24) >> 23) + 1;
+            desc.aux = condCode;
+            EmitHelperCallWithDesc((const void*)&RunThumbCondBranch, &desc, sizeof(desc), tailReturn);
             return true;
         }
 
-        A32BranchDesc desc;
-        desc.r15 = r15;
-        desc.codeCycles = instr.CodeCycles;
-        desc.target = target + 1;
-        desc.aux = cond;
+        // Native conditional branch — mirrors the proven conditional-BX emission.
+        // Both taken and not-taken exit the JIT block (BCOND Branches()), so this
+        // is always a tail instruction.  RunThumbCondBranch semantics:
+        //   taken     → R15 = target (Thumb), jump cycles via EmitJumpToConst
+        //   not-taken → R15 = Addr+4 (pipeline PC), AddCycles_C, return to dispatch
+        const s32 offset = (s32)(op << 24) >> 23;
+        const u32 target = (instr.Addr + 4) + (u32)offset + 1;   // +1 = Thumb bit
 
-        EmitHelperCallWithDesc((const void*)&RunThumbCondBranch, &desc, sizeof(desc), tailReturn);
+        EmitStoreR15(instr.Addr + 4);          // not-taken pipeline PC
+        EmitLoadGuestCPSRFlags();              // seed host CPSR for the condition
+        u8* skip = EmitBranchPlaceholder(condCode ^ 1u);  // skip taken path if cond fails
+        EmitJumpToConst(cpu, target, true, true, true);   // taken: set PC + cycles + return
+        PatchBranch(skip, CodePtr);            // not-taken lands here
+        EmitAddCycles(instr, true, cpu);       // AddCycles_C equivalent
+        EmitReturn();
         return true;
     }
 
@@ -6858,7 +7241,8 @@ bool Compiler::TryEmitThumbNative(const FetchedInstr& instr, ARM* cpu, bool tail
         desc.target = desc.r15 + offset + 1;
         desc.aux = 0;
 
-        EmitJumpToConst(cpu, desc.target, true, true, tailReturn);
+        EmitJumpToConst(cpu, desc.target, true, true, tailReturn,
+                        /*allowLink=*/true);       // M31: unconditional static tail
         return true;
     }
 
@@ -6907,8 +7291,12 @@ void Compiler::EmitInterpreterFallback(const FetchedInstr& instr, bool thumb, bo
 
 void Compiler::EmitHelperCallWithDesc(const void* helper, const void* desc, u32 descSize, bool tailReturn)
 {
-    FlushRegAllocForHelper();
     assert((descSize & 0x3) == 0);
+
+    // M29: spill deferred flags + dirty cached regs before the C helper reads/writes
+    // guest state.  Emitted before the r0=r4/arg setup below so its R0/R1/R3 scratch
+    // use can't clobber the call.  No-op for barrier instructions (already flushed).
+    OnHelperEmitted();
 
     if (tailReturn)
     {
@@ -6939,7 +7327,6 @@ void Compiler::EmitHelperCallWithDesc(const void* helper, const void* desc, u32 
 
 void Compiler::EmitHelperCallLoadedPC(int pcReg, bool restoreCPSR)
 {
-    FlushRegAllocForHelper();
     EmitU32(0xE1A00004); // mov r0, r4
     if (pcReg != R1)
         EmitMovRegShiftImm(R1, pcReg, Shift_LSL, 0, false);
@@ -6951,7 +7338,6 @@ void Compiler::EmitHelperCallLoadedPC(int pcReg, bool restoreCPSR)
 
 void Compiler::EmitHelperCall1(const void* helper, u32 arg1Imm)
 {
-    FlushRegAllocForHelper();
     EmitLoadImm(R1, arg1Imm);
     EmitU32(0xE1A00004); // mov r0, r4
     EmitU32(0xE59FC004); // ldr ip, [pc, #4]
@@ -6962,7 +7348,6 @@ void Compiler::EmitHelperCall1(const void* helper, u32 arg1Imm)
 
 void Compiler::EmitHelperCall2(const void* helper, int arg1Reg, u32 arg2Imm)
 {
-    FlushRegAllocForHelper();
     if (arg1Reg != R1)
         EmitMovRegShiftImm(R1, arg1Reg, Shift_LSL, 0, false);
     EmitLoadImm(R2, arg2Imm);
@@ -6975,7 +7360,6 @@ void Compiler::EmitHelperCall2(const void* helper, int arg1Reg, u32 arg2Imm)
 
 void Compiler::EmitHelperCall3(const void* helper, int arg1Reg, int arg2Reg, u32 arg3Imm)
 {
-    FlushRegAllocForHelper();
     if (arg2Reg != R2)
         EmitMovRegShiftImm(R2, arg2Reg, Shift_LSL, 0, false);
     if (arg1Reg != R1)
@@ -6990,6 +7374,11 @@ void Compiler::EmitHelperCall3(const void* helper, int arg1Reg, int arg2Reg, u32
 
 void Compiler::EmitReturn()
 {
+    // M29: returning to the dispatcher — make all deferred guest state authoritative
+    // in memory first.  Flag spill uses MRS (reads host CPSR) before anything here
+    // can clobber it; register spill is plain STRs; both are no-ops when nothing is
+    // pending (e.g. a branch whose CompileBlock barrier already flushed).
+    EmitFlushDirtyFlags();
     FlushRegAllocForHelper();
     EmitFlushPendingCycles();
     EmitU32(0xE59FC000); // ldr ip, [pc]
@@ -7062,6 +7451,32 @@ void Compiler::EmitLoadRegOffset(int dst, int base, int offsetReg)
         | ((u32)base << 16)
         | ((u32)dst << 12)
         | (u32)offsetReg);
+}
+
+// M31: LDR dst, [base, idx, LSL #2] — fastmem-lite page-table entry fetch.
+void Compiler::EmitLoadRegOffsetLsl2(int dst, int base, int idxReg)
+{
+    EmitU32(0xE7900100
+        | ((u32)base << 16)
+        | ((u32)dst << 12)
+        | (u32)idxReg);
+}
+
+// M31 fastmem-lite page-table lookup (see ARMJIT_Compiler.h declaration).
+// 5 host instructions: MOV(LSR) + MOVW/MOVT + LDR(lsl2) + CMP + Bcc.
+void Compiler::EmitFastMemLiteLookup(ARM* cpu, bool store,
+                                     u8** helperBranches, int& helperBranchCount)
+{
+    const u32* table = store
+        ? &ARMJIT_Memory::FastMemLiteWrite[cpu->Num][0]
+        : &ARMJIT_Memory::FastMemLiteRead[cpu->Num][0];
+
+    EmitMovRegShiftImm(R3, R0, Shift_LSR,
+                       ARMJIT_Memory::kFastMemLitePageShift, false);  // R3 = page
+    EmitLoadImm(R12, (u32)(uintptr_t)table);
+    EmitLoadRegOffsetLsl2(R12, R12, R3);                              // R12 = delta
+    EmitCmpImm(R12, 0);
+    helperBranches[helperBranchCount++] = EmitBranchPlaceholder(Cond_EQ);
 }
 
 void Compiler::EmitStoreRegOffset(int src, int base, int offsetReg)
@@ -7520,25 +7935,20 @@ void Compiler::EmitMRS(int dst)
 // Uses R3 as scratch. Must be called before emitting any conditional instruction.
 void Compiler::EmitLoadGuestCPSRFlags()
 {
-    EmitFlushDirtyFlags();
+    // M29 Phase 2: if flags are deferred, the host CPSR *already* holds the live
+    // guest NZCV (invariant), so the reseed is redundant — using host flags
+    // directly also avoids the LDR+MSR round-trip AND the matching deferred spill.
+    if (EnableLazyFlags && m_flagsDirty)
+        return;
     EmitLoadReg(R3, R4, ArmMemberOffset(&ARM::CPSR));  // R3 = guest CPSR
     EmitU32(0xE128F003);  // MSR CPSR_f, R3  — copies R3[31:24] (NZCV) into host CPSR
 }
 
 void Compiler::EmitGuestLoad(int dst, int guestReg)
 {
-    if (m_useRegAlloc && guestReg >= 0 && guestReg < 15)
-    {
-        int mapped = RegAllocCache.Mapping[guestReg];
-        if (mapped != -1)
-        {
-            if (dst != mapped)
-                EmitMovRegShiftImm(dst, mapped, Shift_LSL, 0, false);
-            return;
-        }
-    }
     if (guestReg >= 0 && guestReg < 16 && m_rcHostReg[guestReg] != -1)
     {
+        // Register cached in a callee-saved host reg: emit MOV instead of LDR.
         EmitMovRegShiftImm(dst, m_rcHostReg[guestReg], Shift_LSL, 0, false);
         return;
     }
@@ -7547,16 +7957,18 @@ void Compiler::EmitGuestLoad(int dst, int guestReg)
 
 void Compiler::EmitGuestStore(int guestReg, int src)
 {
-    if (m_useRegAlloc && guestReg >= 0 && guestReg < 15)
+    // M29 Phase 1: cached → update the host reg and defer the write-back.
+    // M31 mem-span: while a memory op is being held open across the cache,
+    // writes BYPASS the cache and go straight to cpu->R[] so the native fast
+    // path and the helper fallback path leave identical guest state; the
+    // CompileBlock merge logic reloads the written cached regs afterwards.
+    if (!m_rcMemSpan &&
+        guestReg >= 0 && guestReg < 16 && m_rcHostReg[guestReg] != -1)
     {
-        int mapped = RegAllocCache.Mapping[guestReg];
-        if (mapped != -1)
-        {
-            if (src != mapped)
-                EmitMovRegShiftImm(mapped, src, Shift_LSL, 0, false);
-            RegAllocCache.DirtyRegs |= (1 << guestReg);
-            return;
-        }
+        if (m_rcHostReg[guestReg] != src)
+            EmitMovRegShiftImm(m_rcHostReg[guestReg], src, Shift_LSL, 0, false);  // MOV (S=0)
+        m_rcDirty |= (1u << guestReg);
+        return;
     }
     EmitStoreReg(src, R4, ArmMemberOffset(&ARM::R) + guestReg * 4);
 }
@@ -7564,19 +7976,22 @@ void Compiler::EmitGuestStore(int guestReg, int src)
 // Conditional guest-register store: STR{cond} src, [R4, #guest_Rx_offset].
 void Compiler::EmitCondGuestStore(int guestReg, int src, u32 cond)
 {
-    if (m_useRegAlloc && guestReg >= 0 && guestReg < 15)
+    // M29 Phase 1: cached → conditional MOV into the host reg + mark dirty.  If the
+    // condition is false at runtime the host reg keeps its current (correct) value,
+    // which the later write-back spills; marking dirty unconditionally is safe.
+    // (M31 mem-span bypass mirrors EmitGuestStore — see there.)
+    if (!m_rcMemSpan &&
+        guestReg >= 0 && guestReg < 16 && m_rcHostReg[guestReg] != -1)
     {
-        int mapped = RegAllocCache.Mapping[guestReg];
-        if (mapped != -1)
-        {
-            if (src != mapped)
-                EmitU32(0x01A00000u | ((u32)cond << 28) | ((u32)mapped << 12) | (u32)src);
-            RegAllocCache.DirtyRegs |= (1 << guestReg);
-            return;
-        }
+        int hr = m_rcHostReg[guestReg];
+        if (hr != src)
+            EmitU32((cond << 28) | 0x01A00000u | ((u32)hr << 12) | (u32)src);  // MOV{cond} hr, src
+        m_rcDirty |= (1u << guestReg);
+        return;
     }
     u32 offset = ArmMemberOffset(&ARM::R) + (u32)guestReg * 4;
     assert(offset <= 0xFFF);
+    // StrImm encoding without the AL cond (strip 0xE from [31:28]) then OR in cond.
     EmitU32(0x05800000u | ((u32)R4 << 16) | ((u32)src << 12) | offset | ((u32)cond << 28));
 }
 
@@ -7589,7 +8004,7 @@ void Compiler::EmitStoreR15(u32 r15)
 void Compiler::EmitCopyNZFromReg(int reg)
 {
     EmitCmpImm(reg, 0);
-    MarkHostFlagsDirty(CPSR_NZMask);
+    EmitCopyHostFlags(CPSR_NZMask);
 }
 
 void Compiler::EmitCopyHostFlags(u32 mask)
@@ -7602,6 +8017,194 @@ void Compiler::EmitCopyHostFlags(u32 mask)
     EmitAndReg(R3, R3, R1);
     EmitOrrReg(R0, R0, R3);
     EmitStoreReg(R0, R4, ArmMemberOffset(&ARM::CPSR));
+}
+
+// ─── M29 Phase 2: lazy flag evaluation ──────────────────────────────────────
+// Replaces the eager EmitCopyHostFlags after a flag-setting ALU op.  Only the
+// full-NZCV write is deferred (the host CPSR keeps holding the live guest flags);
+// narrower writes (NZ / NZC) spill eagerly because the host CPSR's other flag
+// bits are no longer a faithful image of the guest after such an op.  The CompileBlock
+// barrier/pre-op logic guarantees any previously-pending NZCV was already spilled
+// or proven dead before this op clobbered the host flags.
+void Compiler::MarkHostFlagsDirty(u32 mask)
+{
+    if (!EnableLazyFlags || mask != CPSR_NZCVMask)
+    {
+        EmitCopyHostFlags(mask);   // eager: feature off, or partial write
+        return;
+    }
+    m_flagsDirty = true;
+    m_flagsDirtyMask = mask;
+}
+
+void Compiler::EmitFlushDirtyFlags()
+{
+    if (!m_flagsDirty)
+        return;
+    m_flagsDirty = false;
+    EmitCopyHostFlags(m_flagsDirtyMask);
+}
+
+// ─── M29 Phase 1: write-back register cache helpers ─────────────────────────
+void Compiler::SaveReg(int guestReg)
+{
+    if (guestReg < 0 || guestReg >= 16 || m_rcHostReg[guestReg] == -1)
+        return;
+    EmitStoreReg(m_rcHostReg[guestReg], R4, ArmMemberOffset(&ARM::R) + (u32)guestReg * 4);
+}
+
+void Compiler::LoadReg(int guestReg)
+{
+    if (guestReg < 0 || guestReg >= 16 || m_rcHostReg[guestReg] == -1)
+        return;
+    EmitLoadReg(m_rcHostReg[guestReg], R4, ArmMemberOffset(&ARM::R) + (u32)guestReg * 4);
+}
+
+void Compiler::FlushRegAllocForHelper()
+{
+    if (!m_rcDirty)
+        return;
+    u16 d = m_rcDirty;
+    while (d) { int g = __builtin_ctz(d); SaveReg(g); d &= d - 1; }
+    m_rcDirty = 0;
+}
+
+void Compiler::DropRegAlloc()
+{
+    memset(m_rcHostReg, -1, sizeof(m_rcHostReg));
+    m_rcDirty = 0;
+    m_rcMemSpan = false;
+}
+
+// M31: kinds the register cache may be held open across — single-transfer
+// memory instructions only.  Their fast/helper paths write a bounded register
+// set (rd / writeback rn / LDRD pair), which the merge logic reloads.
+// Multi-register transfers, SWP, coprocessor, SVC, branches and everything
+// else still drop the cache.
+bool Compiler::IsMemSpanKind(bool thumb, const FetchedInstr& instr) const
+{
+    if (instr.Info.Branches())
+        return false;
+    const u16 k = instr.Info.Kind;
+    if (thumb)
+        return k >= ARMInstrInfo::tk_LDR_PCREL && k <= ARMInstrInfo::tk_LDR_SPREL;
+    return IsArmWordTransferKind(k) || IsArmHalfTransferKind(k);
+}
+
+// M31: at the merge point after a spanned memory op, make the cached copies of
+// every register the instruction may have written (on EITHER runtime path)
+// coherent again by reloading them from cpu->R[].
+void Compiler::ReloadCachedRegsWrittenBy(bool thumb, const FetchedInstr& instr)
+{
+    u32 written = 0;
+    if (!thumb)
+    {
+        u32 r = 0, w = 0;
+        AnalyzeArmRegUsage(instr.Instr, r, w);   // maintained superset (LDRD-safe)
+        written = w;
+    }
+    else
+    {
+        const u16 k = instr.Info.Kind;
+        const u32 op = instr.Instr;
+        switch (k)
+        {
+        case ARMInstrInfo::tk_LDR_PCREL:
+        case ARMInstrInfo::tk_LDR_SPREL:
+            written = 1u << ((op >> 8) & 0x7);
+            break;
+        case ARMInstrInfo::tk_LDR_REG:
+        case ARMInstrInfo::tk_LDRB_REG:
+        case ARMInstrInfo::tk_LDRSB_REG:
+        case ARMInstrInfo::tk_LDRH_REG:
+        case ARMInstrInfo::tk_LDRSH_REG:
+        case ARMInstrInfo::tk_LDR_IMM:
+        case ARMInstrInfo::tk_LDRB_IMM:
+        case ARMInstrInfo::tk_LDRH_IMM:
+            written = 1u << (op & 0x7);
+            break;
+        default:
+            break;   // Thumb stores write no registers
+        }
+    }
+
+    while (written)
+    {
+        int g = __builtin_ctz(written);
+        written &= written - 1;
+        if (g < 16 && m_rcHostReg[g] != -1)
+            LoadReg(g);
+    }
+}
+
+void Compiler::OnHelperEmitted()
+{
+    // Called at the top of every helper-call emitter.  Make guest state coherent
+    // in memory before the C helper reads/writes it, and flag the register cache as
+    // poisoned (the helper may modify cpu->R[]); CompileBlock drops the mappings
+    // after the instruction.  Lazy flags are spilled so the helper sees real CPSR.
+    if (EnableLazyFlags)
+        EmitFlushDirtyFlags();
+    if (EnableRegAllocator)
+    {
+        FlushRegAllocForHelper();   // write back dirty regs so the helper sees them
+        m_rcPoison = true;          // helper may modify cpu->R[] → drop mappings after
+    }
+}
+
+// A "barrier" forces a flag spill + register-cache flush/drop before the
+// instruction.  Only straight-line pure-ALU ops that touch guest state solely via
+// EmitGuestLoad/Store + their own flag write are non-barriers; everything else
+// (memory, branch, PC write, coproc, SVC, MRS/MSR, unknown) is a barrier.
+bool Compiler::IsRegCacheBarrierKind(bool thumb, const FetchedInstr& instr)
+{
+    if (instr.Info.Branches())          // writes PC → block exit / pipeline change
+        return true;
+    const u16 k = instr.Info.Kind;
+    if (thumb)
+        return !(k < ARMInstrInfo::tk_LDR_PCREL);   // ALU range = [tk_LSL_IMM, tk_LDR_PCREL)
+    return !(k < ARMInstrInfo::ak_QADD);            // ALU/MUL range = [ak_AND.., ak_CLZ]
+}
+
+void Compiler::RegAllocPrepareBlock(bool thumb, FetchedInstr instrs[], int emitCount)
+{
+    DropRegAlloc();
+    if (!EnableRegAllocator || emitCount <= 0)
+        return;
+
+    // The cache is dropped at the first (non-spannable) barrier, so the
+    // benefiting window is the leading run of pure-ALU instructions — plus,
+    // with M31 mem-span, any single-transfer memory ops inside that run.
+    int prefix = 0;
+    while (prefix < emitCount &&
+           (!IsRegCacheBarrierKind(thumb, instrs[prefix]) ||
+            (EnableRegAllocatorMemSpan && IsMemSpanKind(thumb, instrs[prefix]))))
+        prefix++;
+    if (prefix < 2)
+        return;   // not worth the block-entry LDRs
+
+    // Rank guest regs r0..r12 by use frequency within the prefix (decoder-provided
+    // SrcRegs/DstRegs cover both ARM and Thumb).  Exclude SP/LR/PC.
+    int useCount[16] = {0};
+    for (int i = 0; i < prefix; i++)
+    {
+        u16 regs = (instrs[i].Info.SrcRegs | instrs[i].Info.DstRegs) & 0x1FFF; // r0..r12
+        while (regs) { int r = __builtin_ctz(regs); useCount[r]++; regs &= regs - 1; }
+    }
+
+    static const int kCacheHostRegs[] = { R5, R6, R7, R8, R9, R10, R11 };
+    constexpr int kMax = (int)(sizeof(kCacheHostRegs) / sizeof(kCacheHostRegs[0]));
+    for (int slot = 0; slot < kMax; slot++)
+    {
+        int best = -1, bestCount = 0;
+        for (int g = 0; g < 13; g++)
+            if (m_rcHostReg[g] == -1 && useCount[g] > bestCount)
+                { best = g; bestCount = useCount[g]; }
+        if (best < 0)
+            break;
+        m_rcHostReg[best] = kCacheHostRegs[slot];
+        LoadReg(best);   // LDR cpu->R[best] → host reg (clean, not dirty)
+    }
 }
 
 void Compiler::EmitAddCycles(const FetchedInstr& instr, bool thumb, ARM* cpu)
@@ -7623,9 +8226,13 @@ void Compiler::EmitAddCyclesConst(u32 cycles)
 }
 
 void Compiler::EmitJumpToConst(ARM* cpu, u32 target, bool sourceThumb,
-                               bool thumbTarget, bool tailReturn)
+                               bool thumbTarget, bool tailReturn, bool allowLink)
 {
-    FlushRegAllocForHelper();
+    // M29: this rewrites the guest CPSR (T bit) and R15; spill any deferred flags
+    // first so the read-modify-write below doesn't race the pending host NZCV.
+    // No-op in practice (callers are branches, already flushed by the barrier).
+    EmitFlushDirtyFlags();
+
     u32 newPC = 0;
     u32 cycles = 0;
 
@@ -7677,7 +8284,82 @@ void Compiler::EmitJumpToConst(ARM* cpu, u32 target, bool sourceThumb,
                     thumbTarget ? "Thumb" : "ARM");
 
     if (tailReturn)
-        EmitReturn();
+    {
+        // M31: unconditional static tail on ARM9 → emit the patchable
+        // direct-link tail instead of the dispatcher return.  The dispatcher
+        // computes the next block's address as R15 - pipelineOffset.
+        if (allowLink && EnableBlockLinking && cpu->Num == 0 &&
+            m_linkSiteCount < kMaxLinkSites)
+            EmitLinkTail(cpu, newPC - (thumbTarget ? 2 : 4));
+        else
+            EmitReturn();
+    }
+}
+
+// M31: cross-block direct-link tail (ARM9). Layout mirrors EmitSelfLinkTail —
+// the same StopExecution + 64-bit ARM9Timestamp/ARM9Target event-horizon
+// bookkeeping the dispatcher loop performs between blocks — but the final
+// branch goes through a patchable data literal:
+//   unlinked: literal = &ARM_Ret  → BX exits to the dispatcher (normal path)
+//   linked:   literal = target block's EntryPoint → direct jump (r4 = cpu is
+//             already live; the eventual ARM_Ret still pops the ORIGINAL
+//             ARM_Dispatch frame, so the host stack stays balanced).
+// Patch/unpatch is a single u32 store to the literal — it is data-loaded
+// (LDR ip,[pc,#..]), so no instruction-cache maintenance is needed.
+void Compiler::EmitLinkTail(ARM* cpu, u32 blockAddr)
+{
+    // Make all deferred guest state authoritative, exactly like EmitReturn.
+    EmitFlushDirtyFlags();
+    FlushRegAllocForHelper();
+    EmitFlushPendingCycles();
+
+    const u32 stopExecOff = ArmMemberOffset(&ARM::StopExecution);
+    const u32 cyclesOff   = ArmMemberOffset(&ARM::Cycles);
+
+    EmitLoadReg(R0, R4, stopExecOff);                         // [+0]
+    EmitU32(0xE3500000);                                      // [+4]  CMP r0,#0
+    u8* stopBranch = EmitBranchPlaceholder(Cond_NE);          // [+8]  BNE .exit
+    EmitLoadReg(R0, R4, cyclesOff);                           // [+12] r0 = Cycles
+    EmitU32(0xE3A01000);                                      // [+16] MOV r1,#0
+    EmitStoreReg(R1, R4, cyclesOff);                          // [+20] Cycles = 0
+    EmitU32(0xE59F1044);                                      // [+24] LDR r1,[pc,#68] → [+100] &ARM9Timestamp
+    EmitU32(LdrImm(R2, R1, 0));                               // [+28]
+    EmitU32(LdrImm(R3, R1, 4));                               // [+32]
+    EmitU32(0xE0B22000);                                      // [+36] ADDS r2,r2,r0
+    EmitU32(0xE2A33000);                                      // [+40] ADC  r3,r3,#0
+    EmitU32(StrImm(R2, R1, 0));                               // [+44]
+    EmitU32(StrImm(R3, R1, 4));                               // [+48]
+    EmitU32(0xE59F102C);                                      // [+52] LDR r1,[pc,#44] → [+104] &ARM9Target
+    EmitU32(LdrImm(R12, R1, 0));                              // [+56]
+    EmitU32(LdrImm(R1, R1, 4));                               // [+60]
+    EmitCmpReg(R3, R1);                                       // [+64]
+    EmitU32(0x0152000C);                                      // [+68] CMPEQ r2,r12
+    u8* deadlineBranch = EmitBranchPlaceholder(Cond_HS);      // [+72] BHS .exit
+    EmitU32(0xE59FC008);                                      // [+76] LDR ip,[pc,#8] → [+92] link literal
+    EmitU32(0xE12FFF1C);                                      // [+80] BX ip (target block or ARM_Ret)
+    u8* exitPoint = CodePtr;                                  // .exit:
+    PatchBranch(stopBranch, exitPoint);
+    PatchBranch(deadlineBranch, exitPoint);
+    EmitU32(0xE59FC004);                                      // [+84] LDR ip,[pc,#4] → [+96] &ARM_Ret
+    EmitU32(0xE12FFF1C);                                      // [+88] BX ip
+    u8* literal = CodePtr;
+    EmitU32((u32)(uintptr_t)&ARM_Ret);                        // [+92] PATCH SITE (unlinked = ARM_Ret)
+    EmitU32((u32)(uintptr_t)&ARM_Ret);                        // [+96]
+    EmitU32((u32)(uintptr_t)&NDS::ARM9Timestamp);             // [+100]
+    EmitU32((u32)(uintptr_t)&NDS::ARM9Target);                // [+104]
+
+    m_linkSites[m_linkSiteCount].literal    = literal;
+    m_linkSites[m_linkSiteCount].targetAddr = blockAddr;
+    m_linkSiteCount++;
+}
+
+int Compiler::TakeLinkSites(LinkSiteRecord* out, int max)
+{
+    int n = m_linkSiteCount < max ? m_linkSiteCount : max;
+    for (int i = 0; i < n; i++)
+        out[i] = m_linkSites[i];
+    m_linkSiteCount = 0;
+    return n;
 }
 
 void Compiler::EmitIncrementCounter(u32* counter)
@@ -7701,7 +8383,6 @@ void Compiler::FlushIcache(u8* start, u8* end)
 
 void Compiler::EmitSelfLinkTail(ARM* cpu, u8* blockStart, u32 branchCycles)
 {
-    FlushRegAllocForHelper();
     // M18 self-link tail (ARM9, ARM/Thumb guest self-loops).
     // Replaces EmitHelperCallWithDesc+ARM_Ret for an unconditional B targeting
     // the current block's first instruction.  Saves the ARM_Dispatch/ARM_Ret

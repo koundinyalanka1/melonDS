@@ -1240,6 +1240,12 @@ void MapSharedWRAM(u8 val)
         SWRAM_ARM7.Mask = 0x7FFF;
         break;
     }
+
+#ifdef JIT_ENABLED
+    // M31: SWRAM/WRAM7 visibility changed — rebuild the fastmem-lite page
+    // tables (must run AFTER SWRAM_ARM9/7 were updated above).
+    ARMJIT_Memory::FastMemLiteRebuild();
+#endif
 }
 
 

@@ -18,16 +18,20 @@
 
 #include <stdio.h>
 #include <string.h>
-
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-#include <arm_neon.h>
-#define GPU3D_HAS_NEON 1
-#endif
 #include <algorithm>
 #include "NDS.h"
 #include "GPU.h"
 #include "FIFO.h"
 #include "Config.h"
+
+// M29 Phase 6: NEON-vectorised 20.12 fixed-point matrix multiply.  The geometry
+// engine multiplies 4x4 / 4x3 matrices on every MTX_MULT command and rebuilds the
+// clip matrix on demand — hot on the ARM9-bound BRAVIA target.  Guarded so the
+// scalar path stays the source of truth on non-NEON builds (x86_64 desktop, etc.).
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    #include <arm_neon.h>
+    #define GPU3D_HAS_NEON 1
+#endif
 
 
 // 3D engine notes
@@ -668,42 +672,73 @@ void MatrixLoad4x3(s32* m, s32* s)
 }
 
 #ifdef GPU3D_HAS_NEON
+
+// out_row[c] = ( sum_k s[srow*4+k] * tmp[k*4+c] ) >> 12, for c = 0..3.
+// Each term is a scalar (s) times a tmp row vector; widening s32*s32->s64 keeps
+// the full 20.12 product, matching the scalar (s64)a*b >> 12.  vshrn_n_s64 is a
+// truncating narrow (low 32 bits after >>12) — identical to the scalar's
+// arithmetic-shift-then-assign-to-s32.
+static inline void NeonMatRow(const int32x2_t* t /* [8]: row0lo,row0hi,...,row3lo,row3hi */,
+                              s32 s0, s32 s1, s32 s2, s32 s3, s32* out)
+{
+    int64x2_t lo = vmull_n_s32(t[0], s0);
+    int64x2_t hi = vmull_n_s32(t[1], s0);
+    lo = vmlal_n_s32(lo, t[2], s1); hi = vmlal_n_s32(hi, t[3], s1);
+    lo = vmlal_n_s32(lo, t[4], s2); hi = vmlal_n_s32(hi, t[5], s2);
+    lo = vmlal_n_s32(lo, t[6], s3); hi = vmlal_n_s32(hi, t[7], s3);
+    vst1_s32(&out[0], vshrn_n_s64(lo, 12));
+    vst1_s32(&out[2], vshrn_n_s64(hi, 12));
+}
+
 static inline void MatrixMult4x4_NEON(s32* m, const s32* s)
 {
     s32 tmp[16];
     memcpy(tmp, m, 16*4);
 
-    for (int row = 0; row < 4; row++)
-    {
-        int32x2_t s0 = vdup_n_s32(s[row*4 + 0]);
-        int32x2_t s1 = vdup_n_s32(s[row*4 + 1]);
-        int32x2_t s2 = vdup_n_s32(s[row*4 + 2]);
-        int32x2_t s3 = vdup_n_s32(s[row*4 + 3]);
+    // tmp split into per-row lo (cols 0,1) / hi (cols 2,3) int32x2 lanes.
+    const int32x2_t t[8] = {
+        vld1_s32(&tmp[0]),  vld1_s32(&tmp[2]),
+        vld1_s32(&tmp[4]),  vld1_s32(&tmp[6]),
+        vld1_s32(&tmp[8]),  vld1_s32(&tmp[10]),
+        vld1_s32(&tmp[12]), vld1_s32(&tmp[14]),
+    };
 
-        int64x2_t acc_lo = vmull_s32(s0, vld1_s32(&tmp[0]));
-        acc_lo = vmlal_s32(acc_lo, s1, vld1_s32(&tmp[4]));
-        acc_lo = vmlal_s32(acc_lo, s2, vld1_s32(&tmp[8]));
-        acc_lo = vmlal_s32(acc_lo, s3, vld1_s32(&tmp[12]));
-
-        int64x2_t acc_hi = vmull_s32(s0, vld1_s32(&tmp[2]));
-        acc_hi = vmlal_s32(acc_hi, s1, vld1_s32(&tmp[6]));
-        acc_hi = vmlal_s32(acc_hi, s2, vld1_s32(&tmp[10]));
-        acc_hi = vmlal_s32(acc_hi, s3, vld1_s32(&tmp[14]));
-
-        vst1_s32(&m[row*4 + 0], vshrn_n_s64(acc_lo, 12));
-        vst1_s32(&m[row*4 + 2], vshrn_n_s64(acc_hi, 12));
-    }
+    for (int r = 0; r < 4; r++)
+        NeonMatRow(t, s[r*4+0], s[r*4+1], s[r*4+2], s[r*4+3], &m[r*4]);
 }
-#endif
+
+static inline void MatrixMult4x3_NEON(s32* m, const s32* s)
+{
+    s32 tmp[16];
+    memcpy(tmp, m, 16*4);
+
+    const int32x2_t t[8] = {
+        vld1_s32(&tmp[0]),  vld1_s32(&tmp[2]),
+        vld1_s32(&tmp[4]),  vld1_s32(&tmp[6]),
+        vld1_s32(&tmp[8]),  vld1_s32(&tmp[10]),
+        vld1_s32(&tmp[12]), vld1_s32(&tmp[14]),
+    };
+
+    // Rows 0..2: 3 source terms each (the implicit 4th source column is 0).
+    for (int r = 0; r < 3; r++)
+        NeonMatRow(t, s[r*3+0], s[r*3+1], s[r*3+2], 0, &m[r*4]);
+
+    // Row 3 (translation): 3 terms + the implicit 1.0 (0x1000) on tmp row 3.
+    NeonMatRow(t, s[9], s[10], s[11], 0x1000, &m[12]);
+}
+
+#endif // GPU3D_HAS_NEON
 
 void MatrixMult4x4(s32* m, s32* s)
 {
 #ifdef GPU3D_HAS_NEON
     MatrixMult4x4_NEON(m, s);
-#else
+    return;
+#endif
     s32 tmp[16];
     memcpy(tmp, m, 16*4);
 
+    // m = s*m
     m[0] = ((s64)s[0]*tmp[0] + (s64)s[1]*tmp[4] + (s64)s[2]*tmp[8] + (s64)s[3]*tmp[12]) >> 12;
     m[1] = ((s64)s[0]*tmp[1] + (s64)s[1]*tmp[5] + (s64)s[2]*tmp[9] + (s64)s[3]*tmp[13]) >> 12;
     m[2] = ((s64)s[0]*tmp[2] + (s64)s[1]*tmp[6] + (s64)s[2]*tmp[10] + (s64)s[3]*tmp[14]) >> 12;
@@ -723,11 +758,14 @@ void MatrixMult4x4(s32* m, s32* s)
     m[13] = ((s64)s[12]*tmp[1] + (s64)s[13]*tmp[5] + (s64)s[14]*tmp[9] + (s64)s[15]*tmp[13]) >> 12;
     m[14] = ((s64)s[12]*tmp[2] + (s64)s[13]*tmp[6] + (s64)s[14]*tmp[10] + (s64)s[15]*tmp[14]) >> 12;
     m[15] = ((s64)s[12]*tmp[3] + (s64)s[13]*tmp[7] + (s64)s[14]*tmp[11] + (s64)s[15]*tmp[15]) >> 12;
-#endif
 }
 
 void MatrixMult4x3(s32* m, s32* s)
 {
+#ifdef GPU3D_HAS_NEON
+    MatrixMult4x3_NEON(m, s);
+    return;
+#endif
     s32 tmp[16];
     memcpy(tmp, m, 16*4);
 
@@ -755,6 +793,29 @@ void MatrixMult4x3(s32* m, s32* s)
 
 void MatrixMult3x3(s32* m, s32* s)
 {
+#ifdef GPU3D_HAS_NEON
+    // M31: same widening 20.12 dot-product scheme as MatrixMult4x4_NEON —
+    // 3 source terms per row, rows 0..2 of m updated, row 3 untouched.
+    {
+        s32 tmpn[12];
+        memcpy(tmpn, m, 12*4);
+        const int32x2_t t[6] = {
+            vld1_s32(&tmpn[0]), vld1_s32(&tmpn[2]),
+            vld1_s32(&tmpn[4]), vld1_s32(&tmpn[6]),
+            vld1_s32(&tmpn[8]), vld1_s32(&tmpn[10]),
+        };
+        for (int r = 0; r < 3; r++)
+        {
+            int64x2_t lo = vmull_n_s32(t[0], s[r*3+0]);
+            int64x2_t hi = vmull_n_s32(t[1], s[r*3+0]);
+            lo = vmlal_n_s32(lo, t[2], s[r*3+1]); hi = vmlal_n_s32(hi, t[3], s[r*3+1]);
+            lo = vmlal_n_s32(lo, t[4], s[r*3+2]); hi = vmlal_n_s32(hi, t[5], s[r*3+2]);
+            vst1_s32(&m[r*4+0], vshrn_n_s64(lo, 12));
+            vst1_s32(&m[r*4+2], vshrn_n_s64(hi, 12));
+        }
+        return;
+    }
+#endif
     s32 tmp[12];
     memcpy(tmp, m, 12*4);
 
@@ -777,6 +838,17 @@ void MatrixMult3x3(s32* m, s32* s)
 
 void MatrixScale(s32* m, s32* s)
 {
+#ifdef GPU3D_HAS_NEON
+    // M31: rows 0..2 scaled by s[0..2]; row 3 untouched.
+    for (int r = 0; r < 3; r++)
+    {
+        int64x2_t lo = vmull_n_s32(vld1_s32(&m[r*4+0]), s[r]);
+        int64x2_t hi = vmull_n_s32(vld1_s32(&m[r*4+2]), s[r]);
+        vst1_s32(&m[r*4+0], vshrn_n_s64(lo, 12));
+        vst1_s32(&m[r*4+2], vshrn_n_s64(hi, 12));
+    }
+    return;
+#endif
     m[0] = ((s64)s[0]*m[0]) >> 12;
     m[1] = ((s64)s[0]*m[1]) >> 12;
     m[2] = ((s64)s[0]*m[2]) >> 12;
@@ -795,6 +867,20 @@ void MatrixScale(s32* m, s32* s)
 
 void MatrixTranslate(s32* m, s32* s)
 {
+#ifdef GPU3D_HAS_NEON
+    // M31: row3 += (s0*row0 + s1*row1 + s2*row2) >> 12, same widening scheme.
+    {
+        int64x2_t lo = vmull_n_s32(vld1_s32(&m[0]), s[0]);
+        int64x2_t hi = vmull_n_s32(vld1_s32(&m[2]), s[0]);
+        lo = vmlal_n_s32(lo, vld1_s32(&m[4]), s[1]);
+        hi = vmlal_n_s32(hi, vld1_s32(&m[6]), s[1]);
+        lo = vmlal_n_s32(lo, vld1_s32(&m[8]), s[2]);
+        hi = vmlal_n_s32(hi, vld1_s32(&m[10]), s[2]);
+        vst1_s32(&m[12], vadd_s32(vld1_s32(&m[12]), vshrn_n_s64(lo, 12)));
+        vst1_s32(&m[14], vadd_s32(vld1_s32(&m[14]), vshrn_n_s64(hi, 12)));
+        return;
+    }
+#endif
     m[12] += ((s64)s[0]*m[0] + (s64)s[1]*m[4] + (s64)s[2]*m[8]) >> 12;
     m[13] += ((s64)s[0]*m[1] + (s64)s[1]*m[5] + (s64)s[2]*m[9]) >> 12;
     m[14] += ((s64)s[0]*m[2] + (s64)s[1]*m[6] + (s64)s[2]*m[10]) >> 12;
@@ -1465,10 +1551,29 @@ void SubmitVertex()
     Vertex* vertextrans = &TempVertexBuffer[VertexNumInPoly];
 
     UpdateClipMatrix();
+#ifdef GPU3D_HAS_NEON
+    // M31: per-vertex clip transform — Position[c] = (Σk v[k]·CM[k*4+c]) >> 12
+    // with the same widening 20.12 scheme as the NEON matrix multiplies
+    // (vshrn_n_s64 truncating narrow == scalar s64>>12 assigned to s32).
+    {
+        const s32 vx = CurVertex[0], vy = CurVertex[1], vz = CurVertex[2];
+        int64x2_t lo = vmull_n_s32(vld1_s32(&ClipMatrix[0]), vx);
+        int64x2_t hi = vmull_n_s32(vld1_s32(&ClipMatrix[2]), vx);
+        lo = vmlal_n_s32(lo, vld1_s32(&ClipMatrix[4]), vy);
+        hi = vmlal_n_s32(hi, vld1_s32(&ClipMatrix[6]), vy);
+        lo = vmlal_n_s32(lo, vld1_s32(&ClipMatrix[8]), vz);
+        hi = vmlal_n_s32(hi, vld1_s32(&ClipMatrix[10]), vz);
+        lo = vmlal_n_s32(lo, vld1_s32(&ClipMatrix[12]), 0x1000);
+        hi = vmlal_n_s32(hi, vld1_s32(&ClipMatrix[14]), 0x1000);
+        vst1_s32(&vertextrans->Position[0], vshrn_n_s64(lo, 12));
+        vst1_s32(&vertextrans->Position[2], vshrn_n_s64(hi, 12));
+    }
+#else
     vertextrans->Position[0] = (vertex[0]*ClipMatrix[0] + vertex[1]*ClipMatrix[4] + vertex[2]*ClipMatrix[8] + vertex[3]*ClipMatrix[12]) >> 12;
     vertextrans->Position[1] = (vertex[0]*ClipMatrix[1] + vertex[1]*ClipMatrix[5] + vertex[2]*ClipMatrix[9] + vertex[3]*ClipMatrix[13]) >> 12;
     vertextrans->Position[2] = (vertex[0]*ClipMatrix[2] + vertex[1]*ClipMatrix[6] + vertex[2]*ClipMatrix[10] + vertex[3]*ClipMatrix[14]) >> 12;
     vertextrans->Position[3] = (vertex[0]*ClipMatrix[3] + vertex[1]*ClipMatrix[7] + vertex[2]*ClipMatrix[11] + vertex[3]*ClipMatrix[15]) >> 12;
+#endif
 
     // this probably shouldn't be.
     // the way color is handled during clipping needs investigation. TODO
@@ -2484,6 +2589,31 @@ void FinishWork(s32 cycles)
     GXStat &= ~(1<<27);
 }
 
+// ── M31: GPU3D phase profiling (A32JIT_PROFILE builds only) ────────────────
+// Separates the CPU-side geometry cost (GPU3D::Run — vertex transform/clip/
+// polygon setup inside the scheduler) from the renderer cost (VCount215 →
+// CurrentRenderer->RenderFrame, GL command submission on the GL path).
+// Logged once per ~600 rendered frames so it stays out of the hot path.
+#ifndef A32JIT_PROFILE
+#define A32JIT_PROFILE 0
+#endif
+#if A32JIT_PROFILE
+#include <time.h>
+static u64 g_3dRunNS = 0, g_3dRenderNS = 0;
+static u32 g_3dRunCalls = 0, g_3dFrames = 0;
+static inline u64 GPU3DProfNow()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+}
+#define GPU3D_PROF_BEGIN() const u64 prof_t0_ = GPU3DProfNow()
+#define GPU3D_PROF_END(acc, calls) do { (acc) += GPU3DProfNow() - prof_t0_; (calls)++; } while (0)
+#else
+#define GPU3D_PROF_BEGIN() do {} while (0)
+#define GPU3D_PROF_END(acc, calls) do {} while (0)
+#endif
+
 void Run()
 {
     if (!GeometryEnabled || FlushRequest ||
@@ -2492,6 +2622,8 @@ void Run()
         Timestamp = NDS::ARM9Timestamp >> NDS::ARM9ClockShift;
         return;
     }
+
+    GPU3D_PROF_BEGIN();
 
     s32 cycles = (NDS::ARM9Timestamp >> NDS::ARM9ClockShift) - Timestamp;
     CycleCount -= cycles;
@@ -2516,6 +2648,10 @@ void Run()
         if (NumPushPopCommands == 0) GXStat &= ~(1<<14);
         if (NumTestCommands == 0)    GXStat &= ~(1<<0);
     }
+
+#if A32JIT_PROFILE
+    GPU3D_PROF_END(g_3dRunNS, g_3dRunCalls);
+#endif
 }
 
 
@@ -2640,7 +2776,22 @@ void VBlank()
 
 void VCount215()
 {
+#if A32JIT_PROFILE
+    GPU3D_PROF_BEGIN();
     CurrentRenderer->RenderFrame();
+    GPU3D_PROF_END(g_3dRenderNS, g_3dFrames);
+    if (g_3dFrames >= 600)
+    {
+        printf("melonDS GPU3D phases: Run(geom)=%.2fms/frame (%u calls) "
+               "RenderFrame=%.2fms/frame over %u frames\n",
+               (double)g_3dRunNS / 1e6 / g_3dFrames, g_3dRunCalls,
+               (double)g_3dRenderNS / 1e6 / g_3dFrames, g_3dFrames);
+        g_3dRunNS = g_3dRenderNS = 0;
+        g_3dRunCalls = g_3dFrames = 0;
+    }
+#else
+    CurrentRenderer->RenderFrame();
+#endif
 }
 
 void SetRenderXPos(u16 xpos)

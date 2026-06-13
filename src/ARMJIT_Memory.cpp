@@ -47,14 +47,8 @@
 #include "SPU.h"
 
 #include <stdlib.h>
+#include <string.h>
 
-// Phase 4: AArch32 fastmem is now partially supported. IsJITFault returns
-// true for faults inside the JIT code buffer, enabling the fault handler
-// path. Full mmap-based fastmem (4GB VA reservation) is not feasible on
-// 32-bit, so DS memory regions use conventional allocation. The JIT
-// continues to use the guard-chain approach for most accesses; a future
-// iteration can map the ~5 MB of DS memory at known offsets for a
-// lightweight fastmem variant.
 #if defined(__arm__) && !defined(__aarch64__)
 #define ARMJIT_A32_NO_FASTMEM 1
 #endif
@@ -491,6 +485,10 @@ void SetCodeProtection(int region, u32 offset, bool protect)
         SetCodeProtectionRange(effectiveAddr, 0x1000, mapping.Num, protect ? 1 : 2);
 #endif
     }
+
+    // M31: code appeared in / vanished from a page — refresh the fastmem-lite
+    // write tables so stores to code pages keep taking the invalidating helper.
+    FastMemLiteRebuild();
 }
 
 void RemapDTCM(u32 newBase, u32 newSize)
@@ -582,6 +580,8 @@ void RemapSWRAM()
         Mappings[memregion_SharedWRAM][i].Unmap(memregion_SharedWRAM);
     }
     Mappings[memregion_SharedWRAM].Clear();
+    // M31 note: RemapSWRAM runs BEFORE NDS.cpp updates SWRAM_ARM9/7, so the
+    // fastmem-lite rebuild happens at the END of NDS::MapSharedWRAM instead.
 }
 
 bool MapAtAddress(u32 addr)
@@ -872,7 +872,144 @@ void Reset()
         assert(MappingStatus7[i] == memstate_Unmapped);
     }
 
+    // M31: refresh the fastmem-lite tables from the post-reset memory map
+    // (also clears stale code-page write exclusions after ResetBlockCache).
+    FastMemLiteRebuild();
+
     printf("done resetting jit mem\n");
+}
+
+/* ── M31: A32 fastmem-lite page tables (see ARMJIT_Memory.h) ────────────── */
+u32 FastMemLiteRead[2][kFastMemLitePages];
+u32 FastMemLiteWrite[2][kFastMemLitePages];
+static unsigned FastMemLiteRebuildCount = 0;
+
+// Host pointer for the 16 KB guest page starting at pageStart, or NULL when
+// the page is not page-constant direct-safe for this CPU. regionOut receives
+// the classification (valid only for non-NULL returns).
+static u8* FastMemLitePageHost(u32 num, u32 pageStart, int& regionOut)
+{
+    const u32 pageEnd = pageStart + (1u << kFastMemLitePageShift);
+    const int region = num == 0 ? ClassifyAddress9(pageStart)
+                                : ClassifyAddress7(pageStart);
+    regionOut = region;
+
+    if (num == 0)
+    {
+        const u32 dtcmBase = NDS::ARM9->DTCMBase;
+        const u32 dtcmSize = NDS::ARM9->DTCMSize;
+        const u32 dtcmEnd  = dtcmBase + dtcmSize;
+
+        if (region == memregion_DTCM)
+        {
+            // Page-constant only if the DTCM window is page-aligned and the
+            // whole page lies inside it (mirroring within the window then
+            // repeats with 16 KB period, matching DTCMPhysicalSize).
+            if ((dtcmBase & ((1u << kFastMemLitePageShift) - 1)) == 0 &&
+                pageStart >= dtcmBase && pageEnd <= dtcmEnd)
+                return NDS::ARM9->DTCM + ((pageStart - dtcmBase) & (DTCMPhysicalSize - 1));
+            return nullptr;
+        }
+        // A page of any OTHER region that intersects the DTCM window is not
+        // uniform (this is the §6.1 DTCM-overlap lesson, by construction).
+        if (dtcmSize > 0 && pageStart < dtcmEnd && pageEnd > dtcmBase)
+            return nullptr;
+
+        switch (region)
+        {
+        case memregion_ITCM:
+            if (pageEnd <= NDS::ARM9->ITCMSize)
+                return NDS::ARM9->ITCM + (pageStart & (ITCMPhysicalSize - 1));
+            return nullptr;
+        case memregion_MainRAM:
+            return NDS::MainRAM + (pageStart & NDS::MainRAMMask);
+        case memregion_SharedWRAM:
+            if (NDS::SWRAM_ARM9.Mem)
+                return NDS::SWRAM_ARM9.Mem + (pageStart & NDS::SWRAM_ARM9.Mask);
+            return nullptr;
+        default:
+            return nullptr;
+        }
+    }
+    else
+    {
+        switch (region)
+        {
+        case memregion_BIOS7:
+            // 16 KB BIOS == exactly one page at 0. Read-only (the rebuild
+            // loop never puts BIOS7 in the write table). Matches the
+            // existing runtime-chain precedent of direct BIOS7 loads.
+            if (pageEnd <= 0x4000)
+                return NDS::ARM7BIOS + pageStart;
+            return nullptr;
+        case memregion_MainRAM:
+            return NDS::MainRAM + (pageStart & NDS::MainRAMMask);
+        case memregion_SharedWRAM:
+            if (NDS::SWRAM_ARM7.Mem)
+                return NDS::SWRAM_ARM7.Mem + (pageStart & NDS::SWRAM_ARM7.Mask);
+            return nullptr;
+        case memregion_WRAM7:
+            return NDS::ARM7WRAM + (pageStart & (NDS::ARM7WRAMSize - 1));
+        default:
+            return nullptr;
+        }
+    }
+}
+
+// True when any 512-byte AddressRange inside this guest page currently holds
+// compiled code (range->Code != 0) — such pages must keep stores on the
+// helper so JIT invalidation runs.
+static bool FastMemLitePageHasCode(u32 num, int region, u32 pageStart)
+{
+    if (!ARMJIT::CodeMemRegions[region])
+        return false;
+
+    const u32 local = LocaliseAddress(region, num, pageStart) & 0x7FFFFFF;
+    ARMJIT::AddressRange* ranges = ARMJIT::CodeMemRegions[region];
+    const u32 first = local / 512;
+    const u32 count = (1u << kFastMemLitePageShift) / 512;   // 32
+    for (u32 i = 0; i < count; i++)
+        if (ranges[first + i].Code)
+            return true;
+    return false;
+}
+
+void FastMemLiteRebuild()
+{
+    if (!NDS::ARM9 || !NDS::MainRAM)
+    {
+        memset(FastMemLiteRead, 0, sizeof(FastMemLiteRead));
+        memset(FastMemLiteWrite, 0, sizeof(FastMemLiteWrite));
+        return;
+    }
+
+    for (u32 num = 0; num < 2; num++)
+    {
+        for (u32 page = 0; page < kFastMemLitePages; page++)
+        {
+            const u32 pageStart = page << kFastMemLitePageShift;
+            int region = memregion_Other;
+            u8* host = FastMemLitePageHost(num, pageStart, region);
+
+            u32 rd = 0, wr = 0;
+            if (host)
+            {
+                rd = (u32)(uintptr_t)host - pageStart;
+                const bool readOnly = region == memregion_BIOS7;
+                if (!readOnly && !FastMemLitePageHasCode(num, region, pageStart))
+                    wr = rd;
+            }
+            FastMemLiteRead[num][page]  = rd;
+            FastMemLiteWrite[num][page] = wr;
+        }
+    }
+
+    FastMemLiteRebuildCount++;
+#ifdef __ANDROID__
+    if (FastMemLiteRebuildCount == 1 || (FastMemLiteRebuildCount & 0x3F) == 0)
+        printf("melonDS A32 fastmem-lite: page tables rebuilt (#%u)\n",
+               FastMemLiteRebuildCount);
+#endif
 }
 
 bool IsFastmemCompatible(int region)

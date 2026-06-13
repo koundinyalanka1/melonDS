@@ -23,6 +23,16 @@
 #include <cstdlib>   // malloc / free
 #include <time.h>    // clock_gettime (A32JIT_PROFILE GL2D phase timing)
 
+// M27: the deferred composite may run on the frontend's render-worker thread,
+// which holds its OWN shared EGL context. eglGetCurrentContext() is how
+// SelectCompositeTargets() distinguishes the two (it's a cheap TLS read).
+#ifdef __ANDROID__
+#include <EGL/egl.h>
+#define M27_HAVE_EGL 1
+#else
+#define M27_HAVE_EGL 0
+#endif
+
 #ifndef YAGE_MELONDS_GL_DIAG
 #define YAGE_MELONDS_GL_DIAG 0
 #endif
@@ -75,6 +85,56 @@ static void texParamsDefault(GLenum target)
     glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 }
+
+// ── M27 parallel render (hybrid) — deferred-render state ────────────────────
+// When enabled by the frontend (yage), DrawScanline(191) does NOT composite
+// inline on the emulation thread. Instead it records the unit as "pending" and
+// the frontend's render worker — which holds a shared EGL context — drains the
+// pending units via melonds_m27_execute() so the heavy GL composite overlaps
+// the VBlank portion of the same frame's CPU emulation. Internal linkage;
+// referenced by the extern "C" hooks at the end of this file.
+static bool   m27Enabled            = false;
+static Unit*  m27PendingUnit[2]     = { nullptr, nullptr };
+static GLRenderer2D* m27Renderer    = nullptr;
+
+struct M27UnitSnap {
+    u32  DispCnt;
+    u32  Tex3D;     // GPU3D output texture as of scanline 191 — the VCount215
+                    // 3D render flips FrontBuffer concurrently with the worker,
+                    // so the live Get3DOutputTexture() is not snapshot-safe.
+    u16  BGCnt[4];
+    u16  BlendCnt;
+    u8   EVA, EVB, EVY;
+    bool Enabled;
+    bool preRenderDone;
+};
+static M27UnitSnap m27Snap[2] = {};
+
+// M27 worker-thread plumbing. The frontend (yage_frame_loop.c) registers two
+// callbacks:
+//   kick — called on the EMULATION thread at DrawScanline(191) once the
+//          frame's units are snapshotted+pre-rendered; the frontend submits
+//          melonds_m27_execute() to its render worker (own shared EGL ctx).
+//   wait — CPU-joins that worker job; called from M27SyncForConsume() on the
+//          main-context thread before anything consumes the worker's output.
+// Deferral only happens while a kick callback is registered — without a
+// consumer the inline (pre-M27) render path is used, so the feature is
+// inert unless the frontend wires it.
+static void (*m27KickCb)(void)      = nullptr;
+static void (*m27WaitCb)(void)      = nullptr;
+static bool   m27Submitted          = false;   // kick issued, wait not yet done
+static GLsync m27Fence              = nullptr; // worker → main-ctx GPU ordering
+static unsigned m27SubmitCount      = 0;
+static unsigned m27ExecCount        = 0;
+static unsigned m27WaitCount        = 0;
+static unsigned m27InlineFallback   = 0;
+
+// Worker-thread composite reads register/scanline state the ARM9 keeps
+// mutating during VBlank, so RenderScreen/UpdateCompositorConfig read from
+// this snapshot (set around the worker's RenderScreen call) instead of the
+// live Unit. The per-scanline config is memcpy'd at line 191 for the same
+// reason (the emulation thread starts rewriting it at line 0 of frame N+1).
+static const M27UnitSnap* m27UseSnap = nullptr;
 
 // ── M20: GL 2D renderer CPU-phase profiling ──────────────────────────────────
 // retro_run wall-time ≈ NDS::RunFrame, with no GPU wait, so the A53 CPU — not the
@@ -225,6 +285,10 @@ static bool GPU2D_TryLoadBinaries(const char* path, GLuint out[4])
             out[i] = glCreateProgram();
             glProgramBinary(out[i], (GLenum)fmt32, data, (GLsizei)len32);
             free(data);
+            // Adreno drivers leave GL_INVALID_OPERATION in the error queue when they
+            // reject a binary from a prior EGL context.  Drain it now so CHECK_GL
+            // calls later (e.g. glBindVertexArray) don't misattribute the stale error.
+            { GLenum _e; while ((_e = glGetError()) != GL_NO_ERROR) (void)_e; }
             GLint status = 0;
             glGetProgramiv(out[i], GL_LINK_STATUS, &status);
             if (!status) ok = false;
@@ -589,6 +653,20 @@ bool GLRenderer2D::InitResources()
         glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, 1, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, zero);
     }
 
+    // M27: remember which EGL context owns the original FBO/VAO containers,
+    // and default the per-call composite targets to them. A new generation
+    // invalidates any worker-context clones built against the old objects.
+#if M27_HAVE_EGL
+    MainGLContext = (void*)eglGetCurrentContext();
+#endif
+    CurOutputFB[0]  = OutputFB[0];
+    CurOutputFB[1]  = OutputFB[1];
+    CurRectVtxArray = RectVtxArray;
+    CompositeObjGen++;
+    M27WorkerCtx = nullptr;
+    M27WorkerOutputFB[0] = M27WorkerOutputFB[1] = 0;
+    M27WorkerVAO = 0;
+
     // size the OBJ render target to the current scale (1× until C5 wires the
     // melonds_opengl_resolution option).
     SetScaleFactor(ScaleFactor);
@@ -606,6 +684,10 @@ bool GLRenderer2D::InitResources()
 
 void GLRenderer2D::SetScaleFactor(int scale)
 {
+    // M27: drain any in-flight worker composite before resizing the textures
+    // it renders into / samples. No-op when nothing was submitted.
+    M27SyncForConsume();
+
     ScaleFactor = scale;
     ScreenW = 256 * scale;
     ScreenH = 192 * scale;
@@ -649,6 +731,15 @@ void GLRenderer2D::SetScaleFactor(int scale)
 
 void GLRenderer2D::DeInitGL()
 {
+    // M27: drain the worker before deleting GL objects it may be using.
+    M27SyncForConsume();
+    m27PendingUnit[0] = m27PendingUnit[1] = nullptr;
+    M27WorkerCtx = nullptr;     // clones die with the worker context
+    M27WorkerOutputFB[0] = M27WorkerOutputFB[1] = 0;
+    M27WorkerVAO = 0;
+    CurOutputFB[0] = CurOutputFB[1] = 0;
+    CurRectVtxArray = 0;
+
     if (LayerPreShader[2])
     {
         glDeleteProgram(LayerPreShader[2]);
@@ -709,6 +800,7 @@ void GLRenderer2D::DeInitGL()
         OBJVRAMValid[u] = false;
         PrevOBJVRAMBytes[u] = 0;
     }
+    m27Renderer = nullptr;
     GLReady = false;
     GPU::GL2DActive = false;
 }
@@ -2069,8 +2161,18 @@ void GLRenderer2D::UpdateCompositorConfig(Unit* unit)
     const int num = unit->Num;
     auto& cfg = CompositorConfig[num];
 
+    // M27: when the composite runs on the render worker, read the frame-N
+    // register snapshot instead of the live Unit (the ARM9 keeps mutating it
+    // during VBlank on the emulation thread).
+    const u32 sDispCnt  = m27UseSnap ? m27UseSnap->DispCnt  : unit->DispCnt;
+    const u16 sBlendCnt = m27UseSnap ? m27UseSnap->BlendCnt : unit->BlendCnt;
+    const u8  sEVA      = m27UseSnap ? m27UseSnap->EVA      : unit->EVA;
+    const u8  sEVB      = m27UseSnap ? m27UseSnap->EVB      : unit->EVB;
+    const u8  sEVY      = m27UseSnap ? m27UseSnap->EVY      : unit->EVY;
+    const u16* sBGCnt   = m27UseSnap ? m27UseSnap->BGCnt    : unit->BGCnt;
+
     // DISPCNT bits 8-12 = BG0-3 + OBJ enable.
-    u32 layerEnable = (unit->DispCnt >> 8) & 0x1F;
+    u32 layerEnable = (sDispCnt >> 8) & 0x1F;
 
     for (int i = 0; i < 4; i++)
         cfg.uBGPrio[i] = (u32)-1;
@@ -2079,7 +2181,7 @@ void GLRenderer2D::UpdateCompositorConfig(Unit* unit)
     {
         if (!(layerEnable & (1u << layer)))
             continue;
-        cfg.uBGPrio[layer] = unit->BGCnt[layer] & 0x3;
+        cfg.uBGPrio[layer] = sBGCnt[layer] & 0x3;
     }
 
     // One-shot compositor dump on first frame with at least one BG layer enabled
@@ -2096,12 +2198,12 @@ void GLRenderer2D::UpdateCompositorConfig(Unit* unit)
     }
 
     cfg.uEnableOBJ    = !!(layerEnable & (1u << 4));
-    cfg.uEnable3D     = !!(unit->DispCnt & (1u << 3));
-    cfg.uBlendCnt     = unit->BlendCnt;
-    cfg.uBlendEffect  = (unit->BlendCnt >> 6) & 0x3;
-    cfg.uBlendCoef[0] = unit->EVA;
-    cfg.uBlendCoef[1] = unit->EVB;
-    cfg.uBlendCoef[2] = unit->EVY;
+    cfg.uEnable3D     = !!(sDispCnt & (1u << 3));
+    cfg.uBlendCnt     = sBlendCnt;
+    cfg.uBlendEffect  = (sBlendCnt >> 6) & 0x3;
+    cfg.uBlendCoef[0] = sEVA;
+    cfg.uBlendCoef[1] = sEVB;
+    cfg.uBlendCoef[2] = sEVY;
 
     glBindBuffer(GL_UNIFORM_BUFFER, CompositorConfigUBO[num]);
     glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(sCompositorConfig), &cfg);
@@ -2154,8 +2256,14 @@ void GLRenderer2D::RenderScreen(int ystart, int yend, Unit* unit)
         archFrame[num]++;
     }
 
+    // M27: per-thread-context draw targets (worker uses FBO/VAO clones) and
+    // frame-N register snapshot when running on the worker.
+    SelectCompositeTargets();
+    const u32  sDispCnt  = m27UseSnap ? m27UseSnap->DispCnt : unit->DispCnt;
+    const bool sEnabled  = m27UseSnap ? m27UseSnap->Enabled : unit->Enabled;
+
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OutputFB[num]);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CurOutputFB[num]);
 
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_STENCIL_TEST);
@@ -2168,12 +2276,12 @@ void GLRenderer2D::RenderScreen(int ystart, int yend, Unit* unit)
     glEnable(GL_SCISSOR_TEST);
     glScissor(0, ystart * ScaleFactor, ScreenW, (yend - ystart) * ScaleFactor);
 
-    bool forcedBlank  = !!(unit->DispCnt & (1u << 7));
-    bool unitEnabled  = unit->Enabled;
+    bool forcedBlank  = !!(sDispCnt & (1u << 7));
+    bool unitEnabled  = sEnabled;
     // DispCnt[17:16] = display mode: 0=off(black), 1=normal, 2=VRAM(A-only),
     // 3=FIFO(A-only). Mode 0 disables the screen entirely (independent of
     // forced-blank bit 7). Common during scene transitions; output is black.
-    u32  dispmode     = (unit->DispCnt >> 16) & (num ? 0x1u : 0x3u);
+    u32  dispmode     = (sDispCnt >> 16) & (num ? 0x1u : 0x3u);
 
     if (forcedBlank || !unitEnabled || dispmode == 0)
     {
@@ -2201,6 +2309,13 @@ void GLRenderer2D::RenderScreen(int ystart, int yend, Unit* unit)
         return;
     }
 
+    if (num == 0 && dispmode == 2)
+    {
+        RenderVRAMDisplay(unit);
+        glDisable(GL_SCISSOR_TEST);
+        return;
+    }
+
     // Periodic log — fires every 60 frames so steady-state is visible.
     static int activeCount[2] = { 0, 0 };
     if (++activeCount[num] % 60 == 1)
@@ -2214,11 +2329,16 @@ void GLRenderer2D::RenderScreen(int ystart, int yend, Unit* unit)
     glBindBufferBase(GL_UNIFORM_BUFFER, 22, ScanlineConfigUBO[num]);
     glBindBufferBase(GL_UNIFORM_BUFFER, 23, CompositorConfigUBO[num]);
 
+    // M27: the worker uploads from the line-191 snapshot — the emulation
+    // thread starts rewriting ScanlineConfig at line 0 of the next frame.
+    const sScanline* scanlineSrc = m27UseSnap
+        ? &M27ScanlineSnap[num].uScanline[ystart]
+        : &ScanlineConfig[num].uScanline[ystart];
     glBindBuffer(GL_UNIFORM_BUFFER, ScanlineConfigUBO[num]);
     glBufferSubData(GL_UNIFORM_BUFFER,
                     ystart * sizeof(sScanline),
                     (yend - ystart) * sizeof(sScanline),
-                    &ScanlineConfig[num].uScanline[ystart]);
+                    scanlineSrc);
 
     UpdateCompositorConfig(unit);
 
@@ -2227,10 +2347,23 @@ void GLRenderer2D::RenderScreen(int ystart, int yend, Unit* unit)
         glActiveTexture(GL_TEXTURE0 + i);
 
         // BG0 samples the GPU3D output when the 3D layer is enabled.
-        if ((i == 0) && (unit->DispCnt & (1u << 3)))
+        if ((i == 0) && (sDispCnt & (1u << 3)))
         {
-            Output3DTex = (GLuint)GPU::Get3DOutputTexture();
-            bool bound3D = GPU::Bind3DOutputTexture();
+            bool bound3D;
+            if (m27UseSnap)
+            {
+                // Worker path: bind the texture snapshotted at scanline 191.
+                // The live FrontBuffer may have flipped (VCount215 3D render
+                // runs concurrently on the emulation thread).
+                Output3DTex = (GLuint)m27UseSnap->Tex3D;
+                bound3D = Output3DTex != 0;
+                glBindTexture(GL_TEXTURE_2D, Output3DTex);
+            }
+            else
+            {
+                Output3DTex = (GLuint)GPU::Get3DOutputTexture();
+                bound3D = GPU::Bind3DOutputTexture();
+            }
             if (!bound3D)
                 glBindTexture(GL_TEXTURE_2D, 0);
 
@@ -2330,7 +2463,7 @@ void GLRenderer2D::RenderScreen(int ystart, int yend, Unit* unit)
     glBindTexture(GL_TEXTURE_2D, MosaicTex);
 
     glBindBuffer(GL_ARRAY_BUFFER, RectVtxBuffer);
-    glBindVertexArray(RectVtxArray);
+    glBindVertexArray(CurRectVtxArray);
     glDrawArrays(GL_TRIANGLES, 0, 2 * 3);
 
     glDisable(GL_SCISSOR_TEST);
@@ -2448,39 +2581,84 @@ void GLRenderer2D::SetFramebuffer(u32* unitA, u32* unitB)
 {
     Framebuffer[0] = unitA;
     Framebuffer[1] = unitB;
+}
 
+void GLRenderer2D::UpdateOutputScreenUnitFromFramebuffer()
+{
     int screenForUnit[2] = { -1, -1 };
     for (int fb = 0; fb < 2; fb++)
     {
         for (int screen = 0; screen < 2; screen++)
         {
-            if (unitA && unitA == GPU::Framebuffer[fb][screen])
+            if (Framebuffer[0] && Framebuffer[0] == GPU::Framebuffer[fb][screen])
                 screenForUnit[0] = screen;
-            if (unitB && unitB == GPU::Framebuffer[fb][screen])
+            if (Framebuffer[1] && Framebuffer[1] == GPU::Framebuffer[fb][screen])
                 screenForUnit[1] = screen;
         }
     }
 
-    int newScreenUnit[2] = { OutputScreenUnit[0], OutputScreenUnit[1] };
+    int observedScreenUnit[2] = { OutputScreenUnit[0], OutputScreenUnit[1] };
     if (screenForUnit[0] >= 0)
-        newScreenUnit[screenForUnit[0]] = 0;
+        observedScreenUnit[screenForUnit[0]] = 0;
     if (screenForUnit[1] >= 0)
-        newScreenUnit[screenForUnit[1]] = 1;
+        observedScreenUnit[screenForUnit[1]] = 1;
 
-    static int lastLogScreenUnit[2] = { -1, -1 };
-    if (newScreenUnit[0] != OutputScreenUnit[0] ||
-        newScreenUnit[1] != OutputScreenUnit[1])
+    if (observedScreenUnit[0] == observedScreenUnit[1])
+        return;
+
+    auto applyObservedMap = [this](const int map[2])
     {
-        OutputScreenUnit[0] = newScreenUnit[0];
-        OutputScreenUnit[1] = newScreenUnit[1];
-    }
-    if (lastLogScreenUnit[0] != OutputScreenUnit[0] ||
-        lastLogScreenUnit[1] != OutputScreenUnit[1])
+        OutputScreenUnit[0] = map[0];
+        OutputScreenUnit[1] = map[1];
+        OutputScreenUnitValid = true;
+        PendingOutputScreenUnit[0] = -1;
+        PendingOutputScreenUnit[1] = -1;
+        PendingOutputScreenUnitFrames = 0;
+        MELONDS_2D_LOG("PRES-MAP top=u%d bottom=u%d",
+                       OutputScreenUnit[0], OutputScreenUnit[1]);
+    };
+
+    if (!OutputScreenUnitValid)
     {
-        lastLogScreenUnit[0] = OutputScreenUnit[0];
-        lastLogScreenUnit[1] = OutputScreenUnit[1];
-        MELONDS_2D_LOG("PRES-MAP top=u%d bottom=u%d", OutputScreenUnit[0], OutputScreenUnit[1]);
+        applyObservedMap(observedScreenUnit);
+        return;
     }
+
+    if (observedScreenUnit[0] == OutputScreenUnit[0] &&
+        observedScreenUnit[1] == OutputScreenUnit[1])
+    {
+        PendingOutputScreenUnit[0] = -1;
+        PendingOutputScreenUnit[1] = -1;
+        PendingOutputScreenUnitFrames = 0;
+        return;
+    }
+
+    // The software path writes pixels into physical top/bottom framebuffers as
+    // the frame is rendered. Direct GL2D presentation instead samples per-engine
+    // OutputTex objects after the frame, so rapid POWCNT1 screen-swap thrash can
+    // pair frame-N textures with frame-N+1 routing. Zelda Phantom Hourglass hits
+    // this as a strict A/B/A/B route alternation. Require a new route to persist
+    // for a few rendered frames before rebinding the presentation map.
+    if (observedScreenUnit[0] == PendingOutputScreenUnit[0] &&
+        observedScreenUnit[1] == PendingOutputScreenUnit[1])
+    {
+        PendingOutputScreenUnitFrames++;
+    }
+    else
+    {
+        PendingOutputScreenUnit[0] = observedScreenUnit[0];
+        PendingOutputScreenUnit[1] = observedScreenUnit[1];
+        PendingOutputScreenUnitFrames = 1;
+        OutputMapSuppressed++;
+        if (OutputMapSuppressed == 1 || (OutputMapSuppressed % 120) == 0)
+            MELONDS_2D_LOG("PRES-MAP pending top=u%d bottom=u%d (waiting for stable route; held top=u%d bottom=u%d, suppressed=%u)",
+                           observedScreenUnit[0], observedScreenUnit[1],
+                           OutputScreenUnit[0], OutputScreenUnit[1],
+                           OutputMapSuppressed);
+    }
+
+    if (PendingOutputScreenUnitFrames >= 3)
+        applyObservedMap(PendingOutputScreenUnit);
 }
 
 void GLRenderer2D::BindOutputTexture(int unit)
@@ -2493,27 +2671,9 @@ void GLRenderer2D::BindOutputTextureForScreen(int screen)
     BindOutputTexture(OutputScreenUnit[screen & 1]);
 }
 
-// ── M27 parallel render (hybrid) ──────────────────────────────────────────
-// When enabled by the frontend (yage), DrawScanline(191) does NOT render
-// inline on the emulation thread. Instead it records the unit as "pending" and
-// the frontend's render worker — which holds a shared EGL context — drains the
-// pending units via melonds_m27_execute() so the heavy GL composite overlaps
-// the next frame's CPU emulation. Internal linkage; referenced by the extern
-// "C" hooks at the end of this file via GPU2D:: qualification.
-static bool   m27Enabled            = false;
-static Unit*  m27PendingUnit[2]     = { nullptr, nullptr };
-static GLRenderer2D* m27Renderer    = nullptr;
-
-struct M27UnitSnap {
-    u32  DispCnt;
-    u16  BGCnt[4];
-    u16  BlendCnt;
-    u8   EVA, EVB, EVY;
-    bool Enabled;
-    bool preRenderDone;
-};
-static M27UnitSnap m27Snap[2] = {};
-
+// (M27 deferred-render state lives near the top of this file so the member
+//  functions that consult it — DeInitGL, UpdateCompositorConfig, RenderScreen —
+//  can see it.)
 
 void GLRenderer2D::DrawScanline(u32 line, Unit* unit)
 {
@@ -2536,26 +2696,48 @@ void GLRenderer2D::DrawScanline(u32 line, Unit* unit)
                            n191, scanlineCount[n191], unit->DispCnt,
                            (int)unit->Enabled, (int)m27Enabled);
 
-        if (m27Enabled)
+        if (m27Enabled && m27KickCb)
         {
             const int n = unit->Num & 1;
 
-            // Snapshot frame-N registers before VBlank can mutate them.
-            m27Snap[n].DispCnt  = unit->DispCnt;
-            memcpy(m27Snap[n].BGCnt, unit->BGCnt, sizeof(m27Snap[n].BGCnt));
-            m27Snap[n].BlendCnt = unit->BlendCnt;
-            m27Snap[n].EVA      = unit->EVA;
-            m27Snap[n].EVB      = unit->EVB;
-            m27Snap[n].EVY      = unit->EVY;
-            m27Snap[n].Enabled  = unit->Enabled;
-            m27Snap[n].preRenderDone = false;
+            // Make sure the previous frame's deferred composite is fully
+            // consumed before we rewrite the layer textures / snapshots it
+            // reads. No-op when the present path already synced; required
+            // when presentation frameskip skipped the present.
+            M27SyncForConsume();
 
             bool forcedBlank = !!(unit->DispCnt & (1u << 7));
-            bool unitEnabled = unit->Enabled;
             u32 dispmode = (unit->DispCnt >> 16) & (n ? 0x1u : 0x3u);
 
-            if (!forcedBlank && unitEnabled && dispmode != 0)
+            // Only the heavy NORMAL-mode composite is deferred. Inactive /
+            // forced-blank / VRAM-direct / FIFO frames render inline: they are
+            // cheap, and RenderVRAMDisplay reads live VRAM (not snapshot-safe
+            // on the worker).
+            if (forcedBlank || !unit->Enabled || dispmode != 1)
             {
+                RenderFrame(unit);
+            }
+            else
+            {
+                // Keep the present map in phase with the textures being
+                // produced (M30 Zelda fix) — RenderFrame normally does this.
+                UpdateOutputScreenUnitFromFramebuffer();
+
+                // Snapshot frame-N registers + per-scanline config before
+                // VBlank (ARM9) can mutate them; the worker composite reads
+                // only these copies.
+                m27Snap[n].DispCnt  = unit->DispCnt;
+                memcpy(m27Snap[n].BGCnt, unit->BGCnt, sizeof(m27Snap[n].BGCnt));
+                m27Snap[n].BlendCnt = unit->BlendCnt;
+                m27Snap[n].EVA      = unit->EVA;
+                m27Snap[n].EVB      = unit->EVB;
+                m27Snap[n].EVY      = unit->EVY;
+                m27Snap[n].Enabled  = unit->Enabled;
+                m27Snap[n].Tex3D    = (unit->DispCnt & (1u << 3))
+                                          ? (u32)GPU::Get3DOutputTexture() : 0;
+                m27Snap[n].preRenderDone = false;
+                memcpy(&M27ScanlineSnap[n], &ScanlineConfig[n], sizeof(sScanlineConfig));
+
                 PrerenderBGLayers(unit);    GL2D_CHK("m27:PrerenderBGLayers");
 
                 bool objWorkEnabled = !!(unit->DispCnt & ((1u << 12) | (1u << 15)));
@@ -2577,12 +2759,27 @@ void GLRenderer2D::DrawScanline(u32 line, Unit* unit)
                 LastSpriteLine[n] = 0;
                 DoRenderSprites(192, unit);  GL2D_CHK("m27:DoRenderSprites");
 
+                // Make the pre-rendered layer textures visible to the worker
+                // context before it samples them.
                 glFlush();
                 m27Snap[n].preRenderDone = true;
+
+                m27Renderer = this;
+                m27PendingUnit[n] = unit;
             }
 
-            m27Renderer = this;
-            m27PendingUnit[n] = unit;
+            // Kick once per frame, after BOTH units were handled (the GPU
+            // draws unit A then unit B per scanline, so B's 191 is last).
+            if (n == 1 && (m27PendingUnit[0] || m27PendingUnit[1]))
+            {
+                m27Submitted = true;
+                m27SubmitCount++;
+                if (m27SubmitCount == 1 || (m27SubmitCount % 600) == 0)
+                    MELONDS_2D_LOG("M27-SUBMIT #%u pending=A:%d B:%d (deferred composite -> worker)",
+                                   m27SubmitCount,
+                                   m27PendingUnit[0] != nullptr, m27PendingUnit[1] != nullptr);
+                m27KickCb();
+            }
         }
         else
             RenderFrame(unit);
@@ -2605,11 +2802,88 @@ void GLRenderer2D::VBlankEnd(Unit* unitA, Unit* unitB)
     (void)unitB;
 }
 
+void GLRenderer2D::RenderVRAMDisplay(Unit* unit)
+{
+    const int scale = ScaleFactor > 0 ? ScaleFactor : 1;
+    const int width = 256 * scale;
+    const int height = 192 * scale;
+    const size_t bytes = (size_t)width * (size_t)height * 4;
+
+    static u8* pixels = nullptr;
+    static size_t pixelCapacity = 0;
+    if (pixelCapacity < bytes)
+    {
+        u8* resized = (u8*)realloc(pixels, bytes);
+        if (!resized)
+        {
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            MELONDS_2D_LOG("VRAM-DISPLAY u0 allocation failed (%zu bytes)", bytes);
+            return;
+        }
+        pixels = resized;
+        pixelCapacity = bytes;
+    }
+
+    const u32 block = (unit->DispCnt >> 18) & 0x3;
+    const u32 base = 0x06800000u + (block * 0x20000u);
+    const int mbMode = (unit->MasterBrightness >> 14) & 0x3;
+    int mbFactor = unit->MasterBrightness & 0x1F;
+    if (mbFactor > 16) mbFactor = 16;
+    auto applyMasterBrightness = [mbMode, mbFactor](int c) -> u8
+    {
+        if (mbMode == 1)
+            c = c + (((0x3F - c) * mbFactor) >> 4);
+        else if (mbMode == 2)
+            c = c - ((c * mbFactor) >> 4);
+
+        if (c < 0) c = 0;
+        if (c > 0x3F) c = 0x3F;
+        return (u8)c;
+    };
+
+    for (int y = 0; y < height; y++)
+    {
+        const int sy = y / scale;
+        for (int x = 0; x < width; x++)
+        {
+            const int sx = x / scale;
+            const u16 color = GPU::ReadVRAM_LCDC<u16>(base + (u32)((sy * 256 + sx) * 2));
+            const u8 r5 = (u8)( color        & 0x1F);
+            const u8 g5 = (u8)((color >> 5)  & 0x1F);
+            const u8 b5 = (u8)((color >> 10) & 0x1F);
+            const u8 r = (u8)(applyMasterBrightness(r5 << 1) << 2);
+            const u8 g = (u8)(applyMasterBrightness(g5 << 1) << 2);
+            const u8 b = (u8)(applyMasterBrightness(b5 << 1) << 2);
+            u8* out = &pixels[((size_t)y * (size_t)width + (size_t)x) * 4];
+
+            // libretro's GL present shader swizzles texture.bgr back to RGB.
+            out[0] = b;
+            out[1] = g;
+            out[2] = r;
+            out[3] = 0xFF;
+        }
+    }
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, OutputTex[0]);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height,
+                    GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+
+    static int vramDisplayCount = 0;
+    if (++vramDisplayCount % 60 == 1)
+        MELONDS_2D_LOG("VRAM-DISPLAY u0 f=%d block=%u DispCnt=%08X lcdc=0x%X mbright=%u/%u",
+                       vramDisplayCount, block, unit->DispCnt, GPU::VRAMMap_LCDC,
+                       mbMode, mbFactor);
+}
+
 void GLRenderer2D::RenderFrame(Unit* unit)
 {
     const int num = unit->Num;
 
     GL2D_CHK("RenderFrame:enter");   // drain errors inherited from 3D/libretro
+    UpdateOutputScreenUnitFromFramebuffer();
 
     const u64 t_total = GL2D_PROF_NOW();
 
@@ -2626,6 +2900,22 @@ void GLRenderer2D::RenderFrame(Unit* unit)
         GL2D_PROF_ADD(CompositeNS, t_comp);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         GL2D_CHK("RenderFrame:inactive-ready");
+        GL2D_PROF_ADD(TotalNS, t_total);
+#if A32JIT_PROFILE
+        GL2DProfile.Calls++; GL2DProfileMaybeLog();
+#endif
+        return;
+    }
+
+    if (num == 0 && dispmode == 2)
+    {
+        LastSpriteLine[num] = 0;
+        LastLine[num] = 0;
+        const u64 t_comp = GL2D_PROF_NOW();
+        RenderScreen(0, 192, unit);  GL2D_CHK("RenderScreen:vram-display");
+        GL2D_PROF_ADD(CompositeNS, t_comp);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        GL2D_CHK("RenderFrame:vram-display-ready");
         GL2D_PROF_ADD(TotalNS, t_total);
 #if A32JIT_PROFILE
         GL2DProfile.Calls++; GL2DProfileMaybeLog();
@@ -2774,8 +3064,73 @@ void GLRenderer2D::RenderFrame(Unit* unit)
 #define M27_EXPORT __attribute__((visibility("default")))
 
 namespace GPU2D {
+
+// Selects the FBO/VAO RenderScreen binds, for the EGL context current on THIS
+// thread. On the main context these are the original objects; on the worker
+// context, lazily-built clones wrapping the SAME shared OutputTex /
+// RectVtxBuffer (FBOs/VAOs are container objects — not shared across
+// contexts; textures/buffers are).
+void GLRenderer2D::SelectCompositeTargets()
+{
+#if M27_HAVE_EGL
+    void* cur = (void*)eglGetCurrentContext();
+    if (cur == MainGLContext || MainGLContext == nullptr)
+    {
+        CurOutputFB[0]  = OutputFB[0];
+        CurOutputFB[1]  = OutputFB[1];
+        CurRectVtxArray = RectVtxArray;
+        return;
+    }
+
+    if (cur != M27WorkerCtx || M27WorkerObjGen != CompositeObjGen)
+    {
+        // (Re)build worker-context clones. Old names from a previous worker
+        // context died with that context; from a previous generation on the
+        // SAME context they are deleted properly.
+        if (cur == M27WorkerCtx)
+        {
+            if (M27WorkerOutputFB[0]) glDeleteFramebuffers(2, M27WorkerOutputFB);
+            if (M27WorkerVAO)         glDeleteVertexArrays(1, &M27WorkerVAO);
+        }
+        M27WorkerOutputFB[0] = M27WorkerOutputFB[1] = 0;
+        M27WorkerVAO = 0;
+
+        glGenFramebuffers(2, M27WorkerOutputFB);
+        for (int u = 0; u < 2; u++)
+        {
+            glBindFramebuffer(GL_FRAMEBUFFER, M27WorkerOutputFB[u]);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_2D, OutputTex[u], 0);
+        }
+        // VAO clone over the shared RectVtxBuffer — mirrors InitResources.
+        glGenVertexArrays(1, &M27WorkerVAO);
+        glBindVertexArray(M27WorkerVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, RectVtxBuffer);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+        glBindVertexArray(0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+        M27WorkerCtx    = cur;
+        M27WorkerObjGen = CompositeObjGen;
+        MELONDS_2D_LOG("M27 worker-context composite objects built (ctx=%p gen=%u FBO=%u/%u VAO=%u)",
+                       cur, CompositeObjGen,
+                       M27WorkerOutputFB[0], M27WorkerOutputFB[1], M27WorkerVAO);
+    }
+
+    CurOutputFB[0]  = M27WorkerOutputFB[0];
+    CurOutputFB[1]  = M27WorkerOutputFB[1];
+    CurRectVtxArray = M27WorkerVAO;
+#else
+    CurOutputFB[0]  = OutputFB[0];
+    CurOutputFB[1]  = OutputFB[1];
+    CurRectVtxArray = RectVtxArray;
+#endif
+}
+
 void GLRenderer2D::RenderPending()
 {
+    bool any = false;
     for (int n = 0; n < 2; n++)
     {
         if (!m27PendingUnit[n])
@@ -2783,47 +3138,73 @@ void GLRenderer2D::RenderPending()
 
         Unit* unit = m27PendingUnit[n];
         m27PendingUnit[n] = nullptr;
-        const auto& snap = m27Snap[n];
 
-        if (!snap.preRenderDone)
-        {
-            // Forced-blank/disabled — no pre-render was done; full path.
-            RenderFrame(unit);
-            continue;
-        }
-
-        // BG/sprite pre-render used frame-N registers. Temporarily restore
-        // them so RenderScreen's UpdateCompositorConfig uses the same values
-        // (ARM9 may have mutated them during VBlank).
-        const u32  savedDispCnt  = unit->DispCnt;
-        const u16  savedBlendCnt = unit->BlendCnt;
-        const u8   savedEVA = unit->EVA, savedEVB = unit->EVB, savedEVY = unit->EVY;
-        const bool savedEnabled  = unit->Enabled;
-        u16 savedBGCnt[4];
-        memcpy(savedBGCnt, unit->BGCnt, sizeof(savedBGCnt));
-
-        unit->DispCnt  = snap.DispCnt;
-        memcpy(unit->BGCnt, snap.BGCnt, sizeof(snap.BGCnt));
-        unit->BlendCnt = snap.BlendCnt;
-        unit->EVA      = snap.EVA;
-        unit->EVB      = snap.EVB;
-        unit->EVY      = snap.EVY;
-        unit->Enabled  = snap.Enabled;
-
+        // Deferral only happens for active normal-mode frames with the
+        // pre-render done (DrawScanline renders everything else inline), so
+        // this is purely the composite pass, reading the frozen snapshot.
+        m27UseSnap = &m27Snap[n];
         LastLine[n] = 0;
         RenderScreen(0, 192, unit);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        m27UseSnap = nullptr;
+        any = true;
+    }
 
-        // Restore live ARM9 state.
-        unit->DispCnt  = savedDispCnt;
-        memcpy(unit->BGCnt, savedBGCnt, sizeof(savedBGCnt));
-        unit->BlendCnt = savedBlendCnt;
-        unit->EVA      = savedEVA;
-        unit->EVB      = savedEVB;
-        unit->EVY      = savedEVY;
-        unit->Enabled  = savedEnabled;
+    if (any)
+    {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        // GPU-side ordering for the main context's consumers (present /
+        // next-frame pre-render). Created on this (worker or fallback)
+        // context; waited via glWaitSync on the consumer's context.
+        if (m27Fence)
+            glDeleteSync(m27Fence);
+        m27Fence = (GLsync)glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        glFlush();
+
+        m27ExecCount++;
+        if (m27ExecCount == 1 || (m27ExecCount % 600) == 0)
+            MELONDS_2D_LOG("M27-EXEC #%u composite executed (thread-local FBO=%u VAO=%u fence=%p)",
+                           m27ExecCount, CurOutputFB[0], CurRectVtxArray, (void*)m27Fence);
     }
 }
+
+// See GPU2D_OpenGL.h. Runs on a main-context thread.
+void M27SyncForConsume()
+{
+    // Note: pending-but-not-yet-submitted units (unit A deferred, unit B's
+    // scanline 191 not reached yet → kick not fired) must NOT be drained
+    // here; only submitted work is consumed.
+    if (!m27Submitted && !m27Fence)
+        return;
+
+    const bool wasSubmitted = m27Submitted;
+    if (m27Submitted && m27WaitCb)
+        m27WaitCb();            // CPU-join the worker job
+    m27Submitted = false;
+
+    // Worker failed (e.g. couldn't bind its EGL context) or never ran:
+    // execute inline on this thread — it holds the main context, so the
+    // original FBO/VAO are used and output is still correct.
+    if (wasSubmitted && (m27PendingUnit[0] || m27PendingUnit[1]) && m27Renderer)
+    {
+        m27InlineFallback++;
+        if (m27InlineFallback == 1 || (m27InlineFallback % 60) == 0)
+            MELONDS_2D_LOG("M27-FALLBACK #%u pending composite executed inline on consumer thread",
+                           m27InlineFallback);
+        m27Renderer->RenderPending();
+    }
+
+    if (m27Fence)
+    {
+        glWaitSync(m27Fence, 0, GL_TIMEOUT_IGNORED);
+        glDeleteSync(m27Fence);
+        m27Fence = nullptr;
+        m27WaitCount++;
+        if (m27WaitCount == 1 || (m27WaitCount % 600) == 0)
+            MELONDS_2D_LOG("M27-WAIT #%u worker composite waited (fence) before consume/present",
+                           m27WaitCount);
+    }
+}
+
 }
 
 extern "C" M27_EXPORT void melonds_m27_set_enabled(int en)
@@ -2831,9 +3212,28 @@ extern "C" M27_EXPORT void melonds_m27_set_enabled(int en)
     GPU2D::m27Enabled = (en != 0);
     if (!GPU2D::m27Enabled)
     {
+        // No GL here — this may be called from a non-GL thread at shutdown.
+        // Dropping pending work is safe (the next inline frame re-renders
+        // everything); a leftover fence object dies with the context.
         GPU2D::m27PendingUnit[0] = nullptr;
         GPU2D::m27PendingUnit[1] = nullptr;
+        GPU2D::m27Submitted = false;
     }
+}
+
+// Frontend registers its render-worker submit hook (called on the emulation
+// thread at DrawScanline(191) when a composite was deferred). Passing NULL
+// disables deferral (inline rendering resumes).
+extern "C" M27_EXPORT void melonds_m27_set_kick_callback(void (*cb)(void))
+{
+    GPU2D::m27KickCb = cb;
+}
+
+// Frontend registers its render-worker CPU-join hook (called on the consumer
+// thread from M27SyncForConsume before the worker's output is used).
+extern "C" M27_EXPORT void melonds_m27_set_wait_callback(void (*cb)(void))
+{
+    GPU2D::m27WaitCb = cb;
 }
 
 extern "C" M27_EXPORT int melonds_m27_is_enabled(void)

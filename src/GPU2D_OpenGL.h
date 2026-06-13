@@ -32,6 +32,18 @@
 namespace GPU2D
 {
 
+// M27: consumer-side sync point for the deferred (worker-thread) GL2D
+// composite. Must be called on a thread holding the MAIN GL context current,
+// BEFORE anything samples OutputTex or re-renders the layer textures the
+// worker composite reads:
+//   - libretro/opengl.cpp render_gl2d_output() (present samples OutputTex)
+//   - GLRenderer2D::DrawScanline(191) (next frame's pre-render rewrites
+//     BGLayerTex/OBJLayerTex and the register snapshots)
+// CPU-joins the render worker (via the frontend wait callback), executes any
+// still-pending composite inline as a fallback, then glWaitSync()s the
+// worker's fence so the GPU orders the cross-context writes before our reads.
+void M27SyncForConsume();
+
 class GLRenderer2D : public Renderer2D
 {
 public:
@@ -132,6 +144,26 @@ private:
     // visible scanline. The libretro GL present path samples OutputTex directly;
     // there is no GPU→CPU readback in the hot path.
     void RenderFrame(Unit* unit);
+    void RenderVRAMDisplay(Unit* unit);
+    void UpdateOutputScreenUnitFromFramebuffer();
+
+    // ── M27 worker-context composite objects ──────────────────────────────
+    // FBOs and VAOs are container objects and are NOT shared between EGL
+    // contexts in the same share group (textures/buffers/programs ARE). When
+    // RenderScreen runs on the frontend's render-worker thread (its own shared
+    // context), it must bind a worker-local FBO wrapping the shared OutputTex
+    // and a worker-local VAO wrapping the shared RectVtxBuffer. Selected per
+    // call by SelectCompositeTargets(); RenderPending() (worker) lazily builds
+    // the worker-local clones.
+    void   SelectCompositeTargets();
+    GLuint CurOutputFB[2]   = {0, 0};   // FBO RenderScreen draws into (this ctx)
+    GLuint CurRectVtxArray  = 0;        // VAO RenderScreen draws with (this ctx)
+    void*  MainGLContext    = nullptr;  // EGLContext captured at InitResources
+    void*  M27WorkerCtx     = nullptr;  // context the worker clones were built on
+    GLuint M27WorkerOutputFB[2] = {0, 0};
+    GLuint M27WorkerVAO     = 0;
+    u32    CompositeObjGen  = 0;        // bumped when main objects are (re)built
+    u32    M27WorkerObjGen  = 0;        // gen the worker clones were built against
 
     bool GLReady = false;
 
@@ -212,6 +244,13 @@ private:
     {
         sScanline uScanline[192];
     } ScanlineConfig[2];
+
+    // M27: frozen copy of ScanlineConfig taken at DrawScanline(191) when the
+    // composite is deferred to the render worker. The emulation thread starts
+    // overwriting ScanlineConfig at line 0 of the NEXT frame, which can race
+    // the worker's glBufferSubData upload; the worker uploads from this
+    // snapshot instead.
+    sScanlineConfig M27ScanlineSnap[2];
 
     // std140 layout for the sprite shaders' ubSpriteConfig (matches the
     // sOAM/ubSpriteConfig block in GPU2D_OpenGL_shaders.h). The shader reads
@@ -306,6 +345,10 @@ private:
     GLuint OutputTex[2] = {0, 0};   // final composited screen (RGBA8, scaled)
     GLuint OutputFB[2]  = {0, 0};
     int    OutputScreenUnit[2] = {0, 1};
+    int    PendingOutputScreenUnit[2] = {-1, -1};
+    int    PendingOutputScreenUnitFrames = 0;
+    bool   OutputScreenUnitValid = false;
+    unsigned OutputMapSuppressed = 0;
     // first scanline not yet composited this frame (per unit).
     int    LastLine[2]  = {0, 0};
 
