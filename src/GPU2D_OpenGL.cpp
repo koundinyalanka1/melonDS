@@ -285,10 +285,6 @@ static bool GPU2D_TryLoadBinaries(const char* path, GLuint out[4])
             out[i] = glCreateProgram();
             glProgramBinary(out[i], (GLenum)fmt32, data, (GLsizei)len32);
             free(data);
-            // Adreno drivers leave GL_INVALID_OPERATION in the error queue when they
-            // reject a binary from a prior EGL context.  Drain it now so CHECK_GL
-            // calls later (e.g. glBindVertexArray) don't misattribute the stale error.
-            { GLenum _e; while ((_e = glGetError()) != GL_NO_ERROR) (void)_e; }
             GLint status = 0;
             glGetProgramiv(out[i], GL_LINK_STATUS, &status);
             if (!status) ok = false;
@@ -611,6 +607,14 @@ bool GLRenderer2D::InitResources()
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
+    // Display-capture source target (engine A only): an RGBA8 colour target
+    // sized alongside OutputTex in SetScaleFactor. Names created here; storage
+    // and FBO attachment happen there.
+    glGenTextures(1, &CaptureTex);
+    glBindTexture(GL_TEXTURE_2D, CaptureTex);
+    texParamsDefault(GL_TEXTURE_2D);
+    glGenFramebuffers(1, &CaptureFB);
+
     // sprite vertex streams (shared scratch, reused per unit). Pre-pass: 2× pos
     // + index per vertex, 6 verts × 128 OBJ. Composite: 2× pos + 2× texcoord +
     // index, 6 verts × up to 256 quads (each OBJ may wrap → up to 2 quads). All
@@ -725,6 +729,21 @@ void GLRenderer2D::SetScaleFactor(int scale)
         glDrawBuffer(GL_COLOR_ATTACHMENT0);
         GL2D_FBO("OutputFB");
     }
+
+    // Display-capture source target — same scale as OutputTex. Invalidate the
+    // CPU readback so the next capture reallocates at the new size.
+    if (CaptureTex)
+    {
+        glBindTexture(GL_TEXTURE_2D, CaptureTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, CaptureFB);
+        glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, CaptureTex, 0);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        GL2D_FBO("CaptureFB");
+    }
+    CaptureReadbackCap = 0;   // force realloc at new ScreenW×ScreenH
+
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     GL2D_CHK("SetScaleFactor");
 }
@@ -769,9 +788,12 @@ void GLRenderer2D::DeInitGL()
     if (SpriteVtxBuffer)    { glDeleteBuffers(1, &SpriteVtxBuffer);         SpriteVtxBuffer = 0; }
     if (MosaicTex)          { glDeleteTextures(1, &MosaicTex);              MosaicTex = 0; }
     if (DummyTexArray)      { glDeleteTextures(1, &DummyTexArray);          DummyTexArray = 0; }
+    if (CaptureTex)         { glDeleteTextures(1, &CaptureTex);             CaptureTex = 0; }
+    if (CaptureFB)          { glDeleteFramebuffers(1, &CaptureFB);          CaptureFB = 0; }
 
     delete[] SpritePreVtxData; SpritePreVtxData = nullptr;
     delete[] SpriteVtxData;    SpriteVtxData = nullptr;
+    free(CaptureReadback);     CaptureReadback = nullptr; CaptureReadbackCap = 0;
 
     for (int u = 0; u < 2; u++)
     {
@@ -800,7 +822,6 @@ void GLRenderer2D::DeInitGL()
         OBJVRAMValid[u] = false;
         PrevOBJVRAMBytes[u] = 0;
     }
-    m27Renderer = nullptr;
     GLReady = false;
     GPU::GL2DActive = false;
 }
@@ -923,7 +944,12 @@ void GLRenderer2D::UpdateScanlineConfig(int line, Unit* unit)
     // per-scanline in the compositor FS. Matches SoftRenderer's ColorBrightness
     // Up/Down (no rounding, factor clamped to 16). Used by virtually every game's
     // scene fade-in/out transitions.
-    cfg.MasterBright = unit->MasterBrightness;
+    //
+    // During a display-capture source pass the hardware taps engine A BEFORE
+    // master brightness (the capture reads BGOBJLine, pre-brightness), so force
+    // it neutral here — otherwise captured VRAM would be double-dimmed once on
+    // capture and again when the VRAM-display path re-applies brightness.
+    cfg.MasterBright = CapturePass ? 0u : unit->MasterBrightness;
 
     // mosaic sizes
     cfg.MosaicSize[0] = unit->BGMosaicSize[0];
@@ -2263,7 +2289,9 @@ void GLRenderer2D::RenderScreen(int ystart, int yend, Unit* unit)
     const bool sEnabled  = m27UseSnap ? m27UseSnap->Enabled : unit->Enabled;
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CurOutputFB[num]);
+    // A capture-source pass composites into CaptureFB; otherwise the per-engine
+    // OutputFB (or the M27 worker's clone of it).
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CapturePass ? CaptureFB : CurOutputFB[num]);
 
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_STENCIL_TEST);
@@ -2309,9 +2337,21 @@ void GLRenderer2D::RenderScreen(int ystart, int yend, Unit* unit)
         return;
     }
 
-    if (num == 0 && dispmode == 2)
+    // VRAM display mode shows a VRAM bank directly — but a capture-source pass
+    // must still run the normal BG+OBJ+3D composite (engine A keeps rendering
+    // internally; that rendered output is what the capture unit taps), so skip
+    // this shortcut while capturing.
+    if (num == 0 && dispmode == 2 && !CapturePass)
     {
         RenderVRAMDisplay(unit);
+        glDisable(GL_SCISSOR_TEST);
+        return;
+    }
+
+    // Display mode 3: main-memory display FIFO (engine A only).
+    if (num == 0 && dispmode == 3 && !CapturePass)
+    {
+        RenderFIFODisplay(unit);
         glDisable(GL_SCISSOR_TEST);
         return;
     }
@@ -2685,6 +2725,12 @@ void GLRenderer2D::DrawScanline(u32 line, Unit* unit)
     // renderer-side consumer.
     UpdateScanlineConfig((int)line, unit);
 
+    // Display mode 3 (engine A only): the screen is fed from the main-RAM
+    // display DMA FIFO, which holds just the current scanline at any instant.
+    // Snapshot it now so RenderFIFODisplay can assemble the whole frame at 191.
+    if (unit->Num == 0 && ((unit->DispCnt >> 16) & 0x3) == 3)
+        memcpy(FIFOSnap[line], unit->DispFIFOBuffer, sizeof(FIFOSnap[line]));
+
     // All 192 scanlines captured for this unit → run the GPU pipeline.
     if (line == 191)
     {
@@ -2709,11 +2755,16 @@ void GLRenderer2D::DrawScanline(u32 line, Unit* unit)
             bool forcedBlank = !!(unit->DispCnt & (1u << 7));
             u32 dispmode = (unit->DispCnt >> 16) & (n ? 0x1u : 0x3u);
 
+            // Engine A with display capture armed must render inline: capture
+            // reads back the composited output and writes VRAM on this (the
+            // emulation) thread, so it cannot run on the M27 render worker.
+            bool captureArmed = (n == 0) && !!(unit->CaptureCnt & (1u << 31));
+
             // Only the heavy NORMAL-mode composite is deferred. Inactive /
-            // forced-blank / VRAM-direct / FIFO frames render inline: they are
-            // cheap, and RenderVRAMDisplay reads live VRAM (not snapshot-safe
-            // on the worker).
-            if (forcedBlank || !unit->Enabled || dispmode != 1)
+            // forced-blank / VRAM-direct / FIFO / capture frames render inline:
+            // they are cheap, and RenderVRAMDisplay / DoDisplayCapture read live
+            // VRAM (not snapshot-safe on the worker).
+            if (forcedBlank || !unit->Enabled || dispmode != 1 || captureArmed)
             {
                 RenderFrame(unit);
             }
@@ -2796,11 +2847,18 @@ void GLRenderer2D::DrawSprites(u32 line, Unit* unit)
 
 void GLRenderer2D::VBlankEnd(Unit* unitA, Unit* unitB)
 {
-    // Display capture (2D engine → VRAM) is deferred (v1); the per-frame work
-    // runs at DrawScanline(191) → RenderFrame.
+    // Display capture (2D engine A → VRAM) runs inline at DrawScanline(191) →
+    // RenderFrame → DoDisplayCapture (capture-armed frames are forced off the
+    // M27 worker path). Nothing to do here.
     (void)unitA;
     (void)unitB;
 }
+
+// 6-bit (0..63) → 8-bit using the same scaling the GL compositor applies
+// (`/63.0`), so the CPU direct-display paths (VRAM display, FIFO display)
+// colour-match composited screens exactly. The previous `v << 2` reached only
+// 0xFC for white and was a few LSBs dimmer than the composited path.
+static inline u8 Expand6To8(u32 v6) { return (u8)((v6 * 255u + 31u) / 63u); }
 
 void GLRenderer2D::RenderVRAMDisplay(Unit* unit)
 {
@@ -2852,9 +2910,9 @@ void GLRenderer2D::RenderVRAMDisplay(Unit* unit)
             const u8 r5 = (u8)( color        & 0x1F);
             const u8 g5 = (u8)((color >> 5)  & 0x1F);
             const u8 b5 = (u8)((color >> 10) & 0x1F);
-            const u8 r = (u8)(applyMasterBrightness(r5 << 1) << 2);
-            const u8 g = (u8)(applyMasterBrightness(g5 << 1) << 2);
-            const u8 b = (u8)(applyMasterBrightness(b5 << 1) << 2);
+            const u8 r = Expand6To8(applyMasterBrightness(r5 << 1));
+            const u8 g = Expand6To8(applyMasterBrightness(g5 << 1));
+            const u8 b = Expand6To8(applyMasterBrightness(b5 << 1));
             u8* out = &pixels[((size_t)y * (size_t)width + (size_t)x) * 4];
 
             // libretro's GL present shader swizzles texture.bgr back to RGB.
@@ -2878,6 +2936,281 @@ void GLRenderer2D::RenderVRAMDisplay(Unit* unit)
                        mbMode, mbFactor);
 }
 
+// DISPCNT display mode 3: main-memory display FIFO (engine A only). The frame
+// was assembled scanline-by-scanline into FIFOSnap by DrawScanline (the FIFO
+// holds only the current line). Convert BGR555 → RGBA with master brightness
+// and upload to OutputTex, exactly like RenderVRAMDisplay. Used by games /
+// homebrew that stream a full-screen bitmap (e.g. some FMV) from main RAM.
+void GLRenderer2D::RenderFIFODisplay(Unit* unit)
+{
+    const int scale  = ScaleFactor > 0 ? ScaleFactor : 1;
+    const int width  = 256 * scale;
+    const int height = 192 * scale;
+    const size_t bytes = (size_t)width * (size_t)height * 4;
+
+    static u8* pixels = nullptr;
+    static size_t pixelCapacity = 0;
+    if (pixelCapacity < bytes)
+    {
+        u8* resized = (u8*)realloc(pixels, bytes);
+        if (!resized)
+        {
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            MELONDS_2D_LOG("FIFO-DISPLAY u0 allocation failed (%zu bytes)", bytes);
+            return;
+        }
+        pixels = resized;
+        pixelCapacity = bytes;
+    }
+
+    const int mbMode = (unit->MasterBrightness >> 14) & 0x3;
+    int mbFactor = unit->MasterBrightness & 0x1F;
+    if (mbFactor > 16) mbFactor = 16;
+    auto applyMasterBrightness = [mbMode, mbFactor](int c) -> u8
+    {
+        if (mbMode == 1)      c = c + (((0x3F - c) * mbFactor) >> 4);
+        else if (mbMode == 2) c = c - ((c * mbFactor) >> 4);
+        if (c < 0) c = 0;
+        if (c > 0x3F) c = 0x3F;
+        return (u8)c;
+    };
+
+    for (int y = 0; y < height; y++)
+    {
+        const u16* srcRow = FIFOSnap[y / scale];
+        for (int x = 0; x < width; x++)
+        {
+            const u16 color = srcRow[x / scale];
+            const u8 r5 = (u8)( color        & 0x1F);
+            const u8 g5 = (u8)((color >> 5)  & 0x1F);
+            const u8 b5 = (u8)((color >> 10) & 0x1F);
+            const u8 r = Expand6To8(applyMasterBrightness(r5 << 1));
+            const u8 g = Expand6To8(applyMasterBrightness(g5 << 1));
+            const u8 b = Expand6To8(applyMasterBrightness(b5 << 1));
+            u8* out = &pixels[((size_t)y * (size_t)width + (size_t)x) * 4];
+            // libretro's GL present shader swizzles texture.bgr back to RGB.
+            out[0] = b; out[1] = g; out[2] = r; out[3] = 0xFF;
+        }
+    }
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, OutputTex[0]);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height,
+                    GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+
+    static int fifoDisplayCount = 0;
+    if (++fifoDisplayCount % 60 == 1)
+        MELONDS_2D_LOG("FIFO-DISPLAY u0 f=%d DispCnt=%08X mbright=%u/%u",
+                       fifoDisplayCount, unit->DispCnt, mbMode, mbFactor);
+}
+
+// ── Display capture (2D engine A → VRAM) ──────────────────────────────────
+// GL port of SoftRenderer::DoCapture. The DS capture unit, when armed via
+// DISPCAPCNT (CaptureCnt) bit 31, writes a 15-bit BGR image into a VRAM bank
+// each frame, built from:
+//   • source A — engine A's rendered output (BG+OBJ composite, with the 3D
+//     layer already blended in by our compositor), tapped BEFORE master
+//     brightness; and/or
+//   • source B — another VRAM bank (BGR555) or the main-memory DISP FIFO.
+// blended per CaptureCnt[30:29] with factors EVA/EVB. Racing games (NFS Carbon)
+// capture the 3D scene here and then show that bank via VRAM display mode, so
+// without this the captured screen reads back as stale/black VRAM.
+//
+// Bit layout used (matches GPU2D::Unit / SoftRenderer):
+//   [4:0]   EVA          [12:8]  EVB
+//   [17:16] dest bank    [19:18] dest offset (<<14 halfwords)
+//   [21:20] size (0:128×128 1:256×64 2:256×128 3:256×192)
+//   [24]    source A select (0 = 2D+3D composite, 1 = 3D only — approximated)
+//   [25]    source B select (0 = VRAM bank, 1 = DISP FIFO)
+//   [27:26] source-B VRAM read offset (<<14; ignored when engine A is in VRAM
+//           display mode)            [30:29] capture source (0:A 1:B 2/3:A+B)
+//   [31]    capture enable (one-shot; cleared here, mirroring the VBlank latch)
+void GLRenderer2D::DoDisplayCapture(Unit* unit)
+{
+    if (!GLReady || !CaptureFB || !CaptureTex)
+        return;   // not yet initialised — leave capture armed for a later frame
+
+    const int num         = unit->Num;             // engine A (0) by construction
+    const u32 captureCnt  = unit->CaptureCnt;
+    const int scale       = ScaleFactor > 0 ? ScaleFactor : 1;
+
+    u32 capwidth, capheight;
+    switch ((captureCnt >> 20) & 0x3)
+    {
+    case 0:  capwidth = 128; capheight = 128; break;
+    case 1:  capwidth = 256; capheight = 64;  break;
+    case 2:  capwidth = 256; capheight = 128; break;
+    default: capwidth = 256; capheight = 192; break;
+    }
+
+    const u32  capMode     = (captureCnt >> 29) & 0x3;     // 0:A 1:B 2/3:A+B
+    const bool srcA_is3D   = !!(captureCnt & (1u << 24));  // approximated (below)
+    const bool srcB_isFIFO = !!(captureCnt & (1u << 25));
+    const u32  dstvram     = (captureCnt >> 16) & 0x3;
+
+    // Destination must be LCDC-mapped (same requirement as VRAM display). If it
+    // isn't the write goes nowhere — drop the capture but still consume the
+    // one-shot enable, as the hardware VBlank latch would.
+    if (!(GPU::VRAMMap_LCDC & (1u << dstvram)))
+    {
+        unit->CaptureCnt &= ~(1u << 31);
+        return;
+    }
+
+    // ── Source A: engine A's composite (BG+OBJ+3D), pre-master-brightness ──
+    // Needed for modes 0, 2 and 3. Composite into CaptureFB (CapturePass forces
+    // the normal pipeline even while engine A is in VRAM-display mode) and read
+    // it back at native resolution. A "3D-only" source A (bit 24) is
+    // approximated by the full composite: setups selecting it normally disable
+    // the 2D layers, so the composite already equals the 3D image.
+    const u8* rb = nullptr;
+    if (capMode != 1)
+    {
+        CapturePass = true;
+        PrerenderBGLayers(unit);
+        bool objWorkEnabled = !!(unit->DispCnt & ((1u << 12) | (1u << 15)));
+        if (objWorkEnabled)
+        {
+            UpdateOAM(0, 192, unit);
+            if (NumSprites[num] > 0)
+            {
+                UploadOBJVRAM(unit);
+                UploadOBJPalette(unit);
+                PrerenderSprites(unit);
+            }
+        }
+        else
+        {
+            NumSprites[num] = 0;
+            SpriteUseMosaic[num] = false;
+        }
+        LastSpriteLine[num] = 0;
+        DoRenderSprites(192, unit);
+        LastLine[num] = 0;
+        RenderScreen(0, 192, unit);   GL2D_CHK("capture:RenderScreen");
+        CapturePass = false;
+
+        const u32 needed = (u32)ScreenW * (u32)ScreenH * 4u;
+        if (CaptureReadbackCap < needed)
+        {
+            u8* resized = (u8*)realloc(CaptureReadback, needed);
+            if (resized) { CaptureReadback = resized; CaptureReadbackCap = needed; }
+            else         { CaptureReadbackCap = 0; CaptureReadback = nullptr; }
+        }
+        if (CaptureReadback && CaptureReadbackCap >= needed)
+        {
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, CaptureFB);
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+            glPixelStorei(GL_PACK_ALIGNMENT, 4);
+            glReadPixels(0, 0, ScreenW, ScreenH, GL_RGBA, GL_UNSIGNED_BYTE, CaptureReadback);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+            rb = CaptureReadback;
+        }
+    }
+
+    // ── Source B: a VRAM bank (BGR555) or the main-memory DISP FIFO ──
+    const u16* srcBvram = nullptr;
+    if (!srcB_isFIFO)
+    {
+        const u32 srcvram = (unit->DispCnt >> 18) & 0x3;
+        if (GPU::VRAMMap_LCDC & (1u << srcvram))
+            srcBvram = (const u16*)GPU::VRAM[srcvram];
+    }
+    // Source-B VRAM read offset applies only when engine A is NOT itself in
+    // VRAM display mode (matches SoftRenderer).
+    u32 srcBbase = 0;
+    if (!srcB_isFIFO && (((unit->DispCnt >> 16) & 0x3) != 2))
+        srcBbase = ((captureCnt >> 26) & 0x3) << 14;
+
+    u16* dst = (u16*)GPU::VRAM[dstvram];
+    const u32 dstBase = (((captureCnt >> 18) & 0x3) << 14);
+
+    u32 eva = captureCnt & 0x1F;
+    u32 evb = (captureCnt >> 8) & 0x1F;
+    if (eva > 16) eva = 16;
+    if (evb > 16) evb = 16;
+
+    for (u32 y = 0; y < capheight; y++)
+    {
+        u32 dstaddr  = (dstBase + y * capwidth) & 0xFFFF;
+        u32 srcBaddr = srcB_isFIFO ? 0u : ((srcBbase + y * 256u) & 0xFFFF);
+
+        // Dirty-mark the destination block for this line (granularity 512 B).
+        GPU::VRAMDirty[dstvram][((dstaddr * 2) / GPU::VRAMDirtyGranularity)] = true;
+
+        const u8* rbRow = rb ? &rb[(size_t)(y * scale) * (size_t)ScreenW * 4u] : nullptr;
+
+        for (u32 x = 0; x < capwidth; x++)
+        {
+            // Source A → BGR555 + alpha. OutputTex stores .bgr, so the readback
+            // bytes for each texel are [B, G, R, A]; downsample by point-sampling
+            // the top-left of each scale×scale block. Engine A's composite is an
+            // opaque scene (the backdrop fills any gaps), so force the capture
+            // alpha bit opaque rather than trusting the compositor's output alpha
+            // — otherwise A+B blends (motion-blur trails) would drop the current
+            // frame and decay toward black.
+            u32 rA = 0, gA = 0, bA = 0, aA = 0;
+            if (rbRow)
+            {
+                const u8* p = &rbRow[(size_t)(x * scale) * 4u];
+                rA = p[2] >> 3; gA = p[1] >> 3; bA = p[0] >> 3;
+                aA = 1u;
+            }
+
+            // Source B value (BGR555). FIFO holds one 256-px line; we reuse the
+            // current buffer for every captured line (per-line FIFO refill is
+            // not modelled in the whole-frame GL path — only matters for the
+            // very rare main-memory-FIFO capture source).
+            u32  vB = 0;
+            bool haveB = false;
+            if (srcB_isFIFO)            { vB = unit->DispFIFOBuffer[x & 0xFF]; haveB = true; }
+            else if (srcBvram)          { vB = srcBvram[srcBaddr];            haveB = true; }
+
+            u16 outc;
+            if (capMode == 0)
+            {
+                outc = (u16)(rA | (gA << 5) | (bA << 10) | (aA ? 0x8000u : 0u));
+            }
+            else if (capMode == 1)
+            {
+                outc = (u16)(haveB ? vB : 0u);
+            }
+            else // 2 / 3 : blend source A + source B
+            {
+                u32 rB = vB & 0x1F, gB = (vB >> 5) & 0x1F, bB = (vB >> 10) & 0x1F;
+                u32 aB = haveB ? (vB >> 15) : 0u;
+                u32 rD = ((rA * aA * eva) + (rB * aB * evb)) >> 4;
+                u32 gD = ((gA * aA * eva) + (gB * aB * evb)) >> 4;
+                u32 bD = ((bA * aA * eva) + (bB * aB * evb)) >> 4;
+                u32 aD = ((eva > 0) ? aA : 0u) | ((evb > 0) ? aB : 0u);
+                if (rD > 0x1F) rD = 0x1F;
+                if (gD > 0x1F) gD = 0x1F;
+                if (bD > 0x1F) bD = 0x1F;
+                outc = (u16)(rD | (gD << 5) | (bD << 10) | (aD << 15));
+            }
+
+            dst[dstaddr] = outc;
+            dstaddr = (dstaddr + 1) & 0xFFFF;
+            if (!srcB_isFIFO) srcBaddr = (srcBaddr + 1) & 0xFFFF;
+        }
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    static int capCount = 0;
+    if (++capCount % 60 == 1)
+        MELONDS_2D_LOG("CAPTURE u0 f=%d mode=%u srcA=%s srcB=%s dst=block%u %ux%u eva=%u evb=%u",
+                       capCount, capMode, srcA_is3D ? "3D~" : "2D",
+                       srcB_isFIFO ? "FIFO" : "VRAM", dstvram, capwidth, capheight, eva, evb);
+
+    // Consume the one-shot capture enable, mirroring the hardware VBlank latch
+    // clear (the SoftRenderer CaptureLatch path doesn't run in GL mode).
+    unit->CaptureCnt &= ~(1u << 31);
+}
+
 void GLRenderer2D::RenderFrame(Unit* unit)
 {
     const int num = unit->Num;
@@ -2890,6 +3223,13 @@ void GLRenderer2D::RenderFrame(Unit* unit)
     bool forcedBlank = !!(unit->DispCnt & (1u << 7));
     bool unitEnabled = unit->Enabled;
     u32 dispmode = (unit->DispCnt >> 16) & (num ? 0x1u : 0x3u);
+
+    // Display capture (engine A only). Runs before the display path so the
+    // VRAM-display read / BG-and-texture reads later this frame already see the
+    // freshly captured pixels. Mirrors the hardware latch condition: capture is
+    // taken only when armed on an active, non-forced-blank engine A.
+    if (num == 0 && (unit->CaptureCnt & (1u << 31)) && unitEnabled && !forcedBlank)
+        DoDisplayCapture(unit);
 
     if (forcedBlank || !unitEnabled || dispmode == 0)
     {
@@ -2907,15 +3247,17 @@ void GLRenderer2D::RenderFrame(Unit* unit)
         return;
     }
 
-    if (num == 0 && dispmode == 2)
+    // Direct-display modes (engine A): VRAM display (2) and main-memory FIFO
+    // display (3). RenderScreen routes each to its uploader.
+    if (num == 0 && (dispmode == 2 || dispmode == 3))
     {
         LastSpriteLine[num] = 0;
         LastLine[num] = 0;
         const u64 t_comp = GL2D_PROF_NOW();
-        RenderScreen(0, 192, unit);  GL2D_CHK("RenderScreen:vram-display");
+        RenderScreen(0, 192, unit);  GL2D_CHK("RenderScreen:direct-display");
         GL2D_PROF_ADD(CompositeNS, t_comp);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        GL2D_CHK("RenderFrame:vram-display-ready");
+        GL2D_CHK("RenderFrame:direct-display-ready");
         GL2D_PROF_ADD(TotalNS, t_total);
 #if A32JIT_PROFILE
         GL2DProfile.Calls++; GL2DProfileMaybeLog();

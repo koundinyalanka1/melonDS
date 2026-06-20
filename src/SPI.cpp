@@ -21,10 +21,14 @@
 #include <stdlib.h>
 #include <string>
 #include <algorithm>
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 #include "Config.h"
 #include "NDS.h"
 #include "DSi.h"
 #include "SPI.h"
+#include "yage_trace.h"
 #include "DSi_SPI_TSC.h"
 #include "Platform.h"
 
@@ -32,10 +36,29 @@
 namespace SPI_Firmware
 {
 
+#ifdef __ANDROID__
+#define MELONDS_FW_LOG(...) __android_log_print(ANDROID_LOG_INFO, "melonDS-FW", __VA_ARGS__)
+#else
+#define MELONDS_FW_LOG(...) printf(__VA_ARGS__)
+#endif
+
 char FirmwarePath[1024];
 u8* Firmware;
 u32 FirmwareLength;
 u32 FirmwareMask;
+
+// When no real firmware.bin is supplied we fall back to a generated firmware.
+// Real DS firmware is persistent flash: several games (notably Pokemon Gen IV/V
+// — Diamond/Pearl/Platinum, HeartGold/SoulSilver, Black/White…) write Wi-Fi /
+// console-identity data into firmware and bind their cartridge save to that
+// state.  Regenerating a blank firmware every boot dropped those writes, so on
+// the next launch the save no longer matched the (fresh) firmware and the game
+// failed its hardware/identity check with "A communication error has occurred."
+// To behave like real flash we persist the generated firmware to its own file
+// and reload it across sessions.  This is independent of the cartridge .sav and
+// applies to every game, not just Pokemon.
+bool UsingGeneratedFirmware = false;
+static const char* GeneratedFirmwareName = "melon_generated_firmware.bin";
 
 u32 UserSettings;
 
@@ -78,6 +101,87 @@ bool VerifyCRC16(u32 start, u32 offset, u32 len, u32 crcoffset)
     return (crc_stored == crc_calced);
 }
 
+void WriteDefaultWifiAccessPoint(u32 offset, bool configured)
+{
+    memset(Firmware + offset, 0, 0x100);
+    if (configured)
+        strncpy((char*)&Firmware[offset + 0x40], "melonAP", 0x20);
+    Firmware[offset + 0xE7] = configured ? 0x00 : 0xFF;
+    Firmware[offset + 0xEF] = 0x01; // connection slot exists
+    *(u16*)&Firmware[offset + 0xFE] = CRC16(&Firmware[offset], 0xFE, 0x0000);
+}
+
+void WriteDefaultFirmwareIdentity()
+{
+    static const u8 defaultmac[6] = {0x00, 0x09, 0xBF, 0x11, 0x22, 0x33};
+    static const u8 bbinit[0x69] =
+    {
+        0x03, 0x17, 0x40, 0x00, 0x1B, 0x6C, 0x48, 0x80, 0x38, 0x00, 0x35, 0x07, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC7, 0xBB, 0x01, 0x24, 0x7F,
+        0x5A, 0x01, 0x3F, 0x01, 0x3F, 0x36, 0x1D, 0x00, 0x78, 0x35, 0x55, 0x12, 0x34, 0x1C, 0x00, 0x01,
+        0x0E, 0x38, 0x03, 0x70, 0xC5, 0x2A, 0x0A, 0x08, 0x04, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFE,
+        0xFE, 0xFE, 0xFE, 0xFC, 0xFC, 0xFA, 0xFA, 0xFA, 0xFA, 0xFA, 0xF8, 0xF8, 0xF6, 0x00, 0x12, 0x14,
+        0x12, 0x41, 0x23, 0x03, 0x04, 0x70, 0x35, 0x0E, 0x2C, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x12, 0x28, 0x1C
+    };
+    static const u8 rfinit[0x29] =
+    {
+        0x31, 0x4C, 0x4F, 0x21, 0x00, 0x10, 0xB0, 0x08, 0xFA, 0x15, 0x26, 0xE6, 0xC1, 0x01, 0x0E, 0x50,
+        0x05, 0x00, 0x6D, 0x12, 0x00, 0x00, 0x01, 0xFF, 0x0E, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x06,
+        0x06, 0x00, 0x00, 0x00, 0x18, 0x00, 0x02, 0x00, 0x00
+    };
+    static const u8 chandata[0x3C] =
+    {
+        0x1E, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0E, 0x0E, 0x0E, 0x0E, 0x0E, 0x0E, 0x0E, 0x16,
+        0x26, 0x1C, 0x1C, 0x1C, 0x1D, 0x1D, 0x1D, 0x1E, 0x1E, 0x1E, 0x1E, 0x1F, 0x1E, 0x1F, 0x18,
+        0x01, 0x4B, 0x4B, 0x4B, 0x4B, 0x4C, 0x4C, 0x4C, 0x4C, 0x4C, 0x4C, 0x4C, 0x4D, 0x4D, 0x4D,
+        0x02, 0x6C, 0x71, 0x76, 0x5B, 0x40, 0x45, 0x4A, 0x2F, 0x34, 0x39, 0x3E, 0x03, 0x08, 0x14
+    };
+
+    // Keep generated firmware useful for games that query DS wireless identity.
+    // The older fallback left this region erased, so direct boot exposed an
+    // invalid FF:FF:FF:FF:FF:FF MAC and bad Wi-Fi CRCs when firmware.bin was
+    // absent. These defaults mirror upstream melonDS generated firmware.
+    memset(Firmware, 0, 0x1D);
+    memcpy(&Firmware[0x04], "MELN", 4);
+    Firmware[0x1D] = 0x20; // DS Lite
+    *(u16*)&Firmware[0x2C] = 0x0138; // Wi-Fi config length
+    Firmware[0x2F] = 0x06; // W006
+    memcpy(&Firmware[0x36], defaultmac, sizeof(defaultmac));
+    *(u16*)&Firmware[0x3C] = 0x3FFE; // channels 1-13 enabled
+    Firmware[0x40] = 0x03; // RF type 3
+    Firmware[0x41] = 0x94;
+    Firmware[0x42] = 0x29;
+    Firmware[0x43] = 0x02;
+    *(u16*)&Firmware[0x44] = 0x0002;
+    *(u16*)&Firmware[0x46] = 0x0017;
+    *(u16*)&Firmware[0x48] = 0x0026;
+    *(u16*)&Firmware[0x4A] = 0x1818;
+    *(u16*)&Firmware[0x4C] = 0x0048;
+    *(u16*)&Firmware[0x4E] = 0x4840;
+    *(u16*)&Firmware[0x50] = 0x0058;
+    *(u16*)&Firmware[0x52] = 0x0042;
+    *(u16*)&Firmware[0x54] = 0x0146;
+    *(u16*)&Firmware[0x56] = 0x8064;
+    *(u16*)&Firmware[0x58] = 0xE6E6;
+    *(u16*)&Firmware[0x5A] = 0x2443;
+    *(u16*)&Firmware[0x5C] = 0x000E;
+    *(u16*)&Firmware[0x5E] = 0x0001;
+    *(u16*)&Firmware[0x60] = 0x0001;
+    *(u16*)&Firmware[0x62] = 0x0402;
+    memcpy(&Firmware[0x64], bbinit, sizeof(bbinit));
+    Firmware[0xCD] = 0x00;
+    memcpy(&Firmware[0xCE], rfinit, sizeof(rfinit));
+    Firmware[0xF7] = 0x02;
+    memcpy(&Firmware[0xF8], chandata, sizeof(chandata));
+    memset(&Firmware[0x134], 0xFF, 0x2C);
+    *(u16*)&Firmware[0x2A] = CRC16(&Firmware[0x2C], *(u16*)&Firmware[0x2C], 0x0000);
+
+    WriteDefaultWifiAccessPoint(0x7FA00 & FirmwareMask, true);
+    WriteDefaultWifiAccessPoint(0x7FB00 & FirmwareMask, false);
+    WriteDefaultWifiAccessPoint(0x7FC00 & FirmwareMask, false);
+}
+
 
 bool Init()
 {
@@ -95,7 +199,7 @@ u32 FixFirmwareLength(u32 originalLength)
 {
     if (originalLength != 0x20000 && originalLength != 0x40000 && originalLength != 0x80000)
     {
-        printf("Bad firmware size %d, ", originalLength);
+        MELONDS_FW_LOG("Bad firmware size %d, ", originalLength);
 
         // pick the nearest power-of-two length
         originalLength |= (originalLength >> 1);
@@ -109,7 +213,7 @@ u32 FixFirmwareLength(u32 originalLength)
         if (originalLength > 0x80000) originalLength = 0x80000;
         else if (originalLength < 0x20000) originalLength = 0x20000;
 
-        printf("assuming %d\n", originalLength);
+        MELONDS_FW_LOG("assuming %d\n", originalLength);
     }
     return originalLength;
 }
@@ -127,6 +231,8 @@ void LoadDefaultFirmware()
 
     // user settings offset
     *(u16*)&Firmware[0x20] = (FirmwareLength - 0x200) >> 3;
+
+    WriteDefaultFirmwareIdentity();
 
     Firmware[userdata+0x00] = 5; // version
 }
@@ -189,6 +295,23 @@ void LoadUserSettingsFromConfig() {
     Firmware[UserSettings+0x50] = messageLength;
 }
 
+// Write the in-memory generated firmware out to its dedicated persistence file.
+// Done right after generation so the SPI write-back path has a real file to
+// update and the next session can reload the exact same firmware (including any
+// Wi-Fi / identity data a game has written) instead of starting from scratch.
+void PersistGeneratedFirmware()
+{
+    if (!Firmware || FirmwareLength == 0) return;
+
+    FILE* f = Platform::OpenLocalFile(GeneratedFirmwareName, "wb");
+    if (f)
+    {
+        fwrite(Firmware, 1, FirmwareLength, f);
+        fclose(f);
+        MELONDS_FW_LOG("Persisted generated firmware (%u bytes).\n", FirmwareLength);
+    }
+}
+
 void Reset()
 {
     if (Firmware) delete[] Firmware;
@@ -202,11 +325,53 @@ void Reset()
     FILE* f = Platform::OpenLocalFile(FirmwarePath, "rb");
     if (!f)
     {
-        printf("Firmware not found generating default one.\n");
-        LoadDefaultFirmware();
+        // No real firmware supplied → use the generated fallback.  Reload a
+        // previously persisted generated firmware when one exists so that any
+        // Wi-Fi / identity data games wrote into it survives across sessions
+        // (this is what stops Pokemon & co. from throwing a communication error
+        // after the first save+relaunch).  Otherwise generate a fresh firmware
+        // and persist it immediately.
+        UsingGeneratedFirmware = true;
+
+        bool loadedPersisted = false;
+        FILE* gf = Platform::OpenLocalFile(GeneratedFirmwareName, "rb");
+        if (gf)
+        {
+            fseek(gf, 0, SEEK_END);
+            long glen = ftell(gf);
+            fseek(gf, 0, SEEK_SET);
+
+            // Only trust a sane, correctly-sized firmware image; anything else
+            // falls through to regeneration so a corrupt file can't brick NDS.
+            if (glen == 0x20000 || glen == 0x40000 || glen == 0x80000)
+            {
+                FirmwareLength = (u32)glen;
+                Firmware = new u8[FirmwareLength];
+                if (fread(Firmware, 1, FirmwareLength, gf) == FirmwareLength)
+                    loadedPersisted = true;
+                else
+                {
+                    delete[] Firmware;
+                    Firmware = NULL;
+                }
+            }
+            fclose(gf);
+        }
+
+        if (loadedPersisted)
+        {
+            MELONDS_FW_LOG("Loaded persisted generated firmware (%u bytes).\n", FirmwareLength);
+        }
+        else
+        {
+            MELONDS_FW_LOG("Firmware not found; generating default firmware.\n");
+            LoadDefaultFirmware();
+            PersistGeneratedFirmware();
+        }
     }
     else
     {
+        UsingGeneratedFirmware = false;
         LoadFirmwareFromFile(f);
     }
 
@@ -252,17 +417,16 @@ void Reset()
         *(u16*)&Firmware[0x2A] = CRC16(&Firmware[0x2C], *(u16*)&Firmware[0x2C], 0x0000);
     }
 
-    printf("MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
-           Firmware[0x36], Firmware[0x37], Firmware[0x38],
-           Firmware[0x39], Firmware[0x3A], Firmware[0x3B]);
+    MELONDS_FW_LOG("MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                   Firmware[0x36], Firmware[0x37], Firmware[0x38],
+                   Firmware[0x39], Firmware[0x3A], Firmware[0x3B]);
 
-    // verify shit
-    printf("FW: WIFI CRC16 = %s\n", VerifyCRC16(0x0000, 0x2C, *(u16*)&Firmware[0x2C], 0x2A)?"GOOD":"BAD");
-    printf("FW: AP1 CRC16 = %s\n", VerifyCRC16(0x0000, 0x7FA00&FirmwareMask, 0xFE, 0x7FAFE&FirmwareMask)?"GOOD":"BAD");
-    printf("FW: AP2 CRC16 = %s\n", VerifyCRC16(0x0000, 0x7FB00&FirmwareMask, 0xFE, 0x7FBFE&FirmwareMask)?"GOOD":"BAD");
-    printf("FW: AP3 CRC16 = %s\n", VerifyCRC16(0x0000, 0x7FC00&FirmwareMask, 0xFE, 0x7FCFE&FirmwareMask)?"GOOD":"BAD");
-    printf("FW: USER0 CRC16 = %s\n", VerifyCRC16(0xFFFF, 0x7FE00&FirmwareMask, 0x70, 0x7FE72&FirmwareMask)?"GOOD":"BAD");
-    printf("FW: USER1 CRC16 = %s\n", VerifyCRC16(0xFFFF, 0x7FF00&FirmwareMask, 0x70, 0x7FF72&FirmwareMask)?"GOOD":"BAD");
+    MELONDS_FW_LOG("FW: WIFI CRC16 = %s\n", VerifyCRC16(0x0000, 0x2C, *(u16*)&Firmware[0x2C], 0x2A)?"GOOD":"BAD");
+    MELONDS_FW_LOG("FW: AP1 CRC16 = %s\n", VerifyCRC16(0x0000, 0x7FA00&FirmwareMask, 0xFE, 0x7FAFE&FirmwareMask)?"GOOD":"BAD");
+    MELONDS_FW_LOG("FW: AP2 CRC16 = %s\n", VerifyCRC16(0x0000, 0x7FB00&FirmwareMask, 0xFE, 0x7FBFE&FirmwareMask)?"GOOD":"BAD");
+    MELONDS_FW_LOG("FW: AP3 CRC16 = %s\n", VerifyCRC16(0x0000, 0x7FC00&FirmwareMask, 0xFE, 0x7FCFE&FirmwareMask)?"GOOD":"BAD");
+    MELONDS_FW_LOG("FW: USER0 CRC16 = %s\n", VerifyCRC16(0xFFFF, 0x7FE00&FirmwareMask, 0x70, 0x7FE72&FirmwareMask)?"GOOD":"BAD");
+    MELONDS_FW_LOG("FW: USER1 CRC16 = %s\n", VerifyCRC16(0xFFFF, 0x7FF00&FirmwareMask, 0x70, 0x7FF72&FirmwareMask)?"GOOD":"BAD");
 
     Hold = 0;
     CurCmd = 0;
@@ -340,6 +504,9 @@ void Write(u8 val, u32 hold)
         Data = 0;
         DataPos = 1;
         Addr = 0;
+#if YAGE_NDS_TRACE
+        NDSTRACE("fw  cmd=%02X begin (generated=%d)", val, (int)UsingGeneratedFirmware);
+#endif
         return;
     }
 
@@ -355,6 +522,19 @@ void Write(u8 val, u32 hold)
             }
             else
             {
+#if YAGE_NDS_TRACE
+                // First byte of the data phase: Addr is the start offset the
+                // game is reading from. Reveals exactly which firmware fields
+                // (Wi-Fi config @002C, MAC @0036, user settings @7FE00…) it
+                // inspects, and the bytes it gets, so the open vs real-hardware
+                // divergence can be diffed directly from the log.
+                if (DataPos == 4)
+                    NDSTRACE("fw  read @%05X  [%02X %02X %02X %02X]", Addr,
+                             Firmware[Addr & FirmwareMask],
+                             Firmware[(Addr + 1) & FirmwareMask],
+                             Firmware[(Addr + 2) & FirmwareMask],
+                             Firmware[(Addr + 3) & FirmwareMask]);
+#endif
                 Data = Firmware[Addr & FirmwareMask];
                 Addr++;
             }
@@ -417,7 +597,20 @@ void Write(u8 val, u32 hold)
 
     if (!hold && (CurCmd == 0x02 || CurCmd == 0x0A))
     {
-        FILE* f = Platform::OpenLocalFile(FirmwarePath, "r+b");
+        // Persist firmware writes so they survive across sessions, exactly like
+        // real flash.  Real firmware updates firmware.bin; the generated
+        // fallback updates its own dedicated file.  Without this the generated
+        // path silently dropped every write (r+b on a non-existent firmware.bin
+        // failed), which is what broke Pokemon-class saves on relaunch.
+        const char* persistPath = UsingGeneratedFirmware ? GeneratedFirmwareName : FirmwarePath;
+        FILE* f = Platform::OpenLocalFile(persistPath, "r+b");
+        if (!f && UsingGeneratedFirmware)
+        {
+            // File not there yet (or first write of the session) — create the
+            // full image, then reopen for the partial region update below.
+            PersistGeneratedFirmware();
+            f = Platform::OpenLocalFile(persistPath, "r+b");
+        }
         if (f)
         {
             u32 cutoff = 0x7FA00 & FirmwareMask;

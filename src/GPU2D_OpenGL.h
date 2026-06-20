@@ -145,6 +145,22 @@ private:
     // there is no GPU→CPU readback in the hot path.
     void RenderFrame(Unit* unit);
     void RenderVRAMDisplay(Unit* unit);
+    // DISPCNT display mode 3 (engine A only): the screen is fed a bitmap
+    // streamed from main RAM through the display DMA FIFO, one scanline per
+    // frame. DrawScanline snapshots each line's DispFIFOBuffer into FIFOSnap;
+    // this uploads the assembled image to OutputTex (like RenderVRAMDisplay).
+    void RenderFIFODisplay(Unit* unit);
+
+    // ── Display capture (2D engine A → VRAM) ──────────────────────────────
+    // When engine A has display capture armed (CaptureCnt bit31), composite
+    // engine A's BG+OBJ+3D output (master-brightness-free, matching the
+    // hardware capture tap which is pre-brightness) into CaptureTex, read it
+    // back, blend with source B (a VRAM bank or the main-memory DISP FIFO) per
+    // CaptureCnt, and write the result as BGR555 into the destination VRAM
+    // bank — exactly where VRAM-display mode and BG/texture units later read
+    // it. The GL port of SoftRenderer::DoCapture; runs inline on the emulation
+    // thread (capture-armed frames are forced off the M27 worker path).
+    void DoDisplayCapture(Unit* unit);
     void UpdateOutputScreenUnitFromFramebuffer();
 
     // ── M27 worker-context composite objects ──────────────────────────────
@@ -344,6 +360,25 @@ private:
     GLuint CompositorConfigUBO[2] = {0, 0};
     GLuint OutputTex[2] = {0, 0};   // final composited screen (RGBA8, scaled)
     GLuint OutputFB[2]  = {0, 0};
+
+    // ── Display-capture source target (engine A only) ─────────────────────
+    // Scratch RGBA8 colour target (screen scale, sized in SetScaleFactor) the
+    // capture-source composite renders into, plus its CPU readback buffer.
+    // CapturePass makes RenderScreen run the normal BG+OBJ+3D composite — even
+    // when engine A is in VRAM/FIFO display mode — into CaptureFB with master
+    // brightness disabled, so DoDisplayCapture can sample the pre-brightness
+    // engine-A output the hardware capture unit taps.
+    GLuint CaptureTex = 0;
+    GLuint CaptureFB  = 0;
+    bool   CapturePass = false;
+    u8*    CaptureReadback    = nullptr;  // ScreenW*ScreenH*4, lazily (re)alloc'd
+    u32    CaptureReadbackCap = 0;
+
+    // Per-scanline snapshot of engine A's display DMA FIFO for display mode 3.
+    // The FIFO holds only the current line at any instant, so DrawScanline
+    // copies each visible line here; RenderFIFODisplay assembles the frame.
+    u16    FIFOSnap[192][256] = {};
+
     int    OutputScreenUnit[2] = {0, 1};
     int    PendingOutputScreenUnit[2] = {-1, -1};
     int    PendingOutputScreenUnitFrames = 0;

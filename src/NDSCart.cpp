@@ -28,6 +28,7 @@
 #include "ROMList.h"
 #include "melonDLDI.h"
 #include "NDSCart_SRAMManager.h"
+#include "yage_trace.h"
 
 #ifdef __LIBRETRO__
 #undef __LIBRETRO_SDK_FILE_STREAM_TRANSFORMS_H
@@ -563,6 +564,18 @@ u8 CartRetail::SPIWrite(u8 val, u32 pos, bool last)
 
     if (pos == 0)
     {
+#if YAGE_NDS_TRACE
+        // Log each new backup-memory command (de-duped so status polling does
+        // not flood the log). This is the conversation the game uses to read /
+        // validate its save; the command it stops on points at the failure.
+        static u8 traceLastCmd = 0xFE;
+        if (val != traceLastCmd)
+        {
+            NDSTRACE("sav cmd=%02X  type=%d len=%u status=%02X",
+                     val, SRAMType, SRAMLength, SRAMStatus);
+            traceLastCmd = val;
+        }
+#endif
         // handle generic commands with no parameters
         switch (val)
         {
@@ -762,6 +775,9 @@ u8 CartRetail::SRAMWrite_FLASH(u8 val, u32 pos, bool last)
         }
         else
         {
+#if YAGE_NDS_TRACE
+            if (pos == 4) NDSTRACE("sav FLASH read  @%06X", SRAMAddr);
+#endif
             u8 ret = SRAM[SRAMAddr & (SRAMLength-1)];
             SRAMAddr++;
             return ret;
@@ -806,6 +822,11 @@ u8 CartRetail::SRAMWrite_FLASH(u8 val, u32 pos, bool last)
 
     case 0x9F: // read JEDEC IC
         // GBAtek says it should be 0xFF. verify?
+#if YAGE_NDS_TRACE
+        // Some save-detection routines read the chip ID here; a value the game
+        // dislikes is a classic "communication error" trigger. Flag every query.
+        NDSTRACE("sav FLASH JEDEC-ID query (pos=%u) -> 0xFF", pos);
+#endif
         return 0xFF;
 
     case 0xD8: // sector erase

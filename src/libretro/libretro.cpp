@@ -12,6 +12,7 @@
 #include "Config.h"
 #include "Platform.h"
 #include "NDS.h"
+#include "ARM.h"   // NDS::ARM9 + ARMv5::DTCM / DTCMPhysicalSize (RA memory map)
 #include "NDSCart_SRAMManager.h"
 #include "GPU.h"
 #include "SPU.h"
@@ -942,7 +943,38 @@ static bool _handle_load_game(unsigned type, const struct retro_game_info *info)
    NDS::SetConsoleType(Config::ConsoleType);
    Frontend::LoadBIOS();
    NDS::LoadROM((u8*)info->data, info->size, save_path.c_str(), Config::DirectBoot);
-   
+
+   // ── RetroAchievements: advertise the NDS memory map ──────────────────────
+   // The frontend resolves rcheevos console addresses to live core memory from
+   // these descriptors. Without a map it falls back to System-RAM-only, so DS
+   // achievement / leaderboard / rich-presence logic that reads ARM9 Data TCM
+   // (rcheevos console address 0x0E000000) can't evaluate. Main RAM size tracks
+   // MainRAMMask so this is correct for both DS (4 MB) and DSi (16 MB).
+   {
+      struct retro_memory_descriptor mdescs[2] = {};
+      unsigned ndesc = 0;
+      if (NDS::MainRAM)
+      {
+         mdescs[ndesc].flags = RETRO_MEMDESC_SYSTEM_RAM;
+         mdescs[ndesc].ptr   = NDS::MainRAM;
+         mdescs[ndesc].start = 0x02000000;
+         mdescs[ndesc].len   = (size_t)NDS::MainRAMMask + 1;
+         ndesc++;
+      }
+      if (NDS::ARM9 && NDS::ARM9->DTCM)
+      {
+         mdescs[ndesc].ptr   = NDS::ARM9->DTCM;
+         mdescs[ndesc].start = 0x0E000000;
+         mdescs[ndesc].len   = DTCMPhysicalSize;
+         ndesc++;
+      }
+      if (ndesc > 0)
+      {
+         struct retro_memory_map mmap = { mdescs, ndesc };
+         environ_cb(RETRO_ENVIRONMENT_SET_MEMORY_MAPS, &mmap);
+      }
+   }
+
    if (type == SLOT_1_2_BOOT)
    {
       char gba_game_name[256];
@@ -1010,36 +1042,59 @@ size_t retro_serialize_size(void)
 
 bool retro_serialize(void *data, size_t size)
 {
-   if (NDS::ConsoleType == 0)
-   {
-      Savestate* savestate = new Savestate(data, size, true);
-      NDS::DoSavestate(savestate);
-      delete savestate;
-
-      return true;
-   }
-   else
+   if (NDS::ConsoleType != 0)
    {
       log_cb(RETRO_LOG_WARN, "Savestates unsupported in DSi mode.\n");
       return false;
    }
+
+   Savestate* savestate = new Savestate(data, size, true);
+   // Bail before writing if the state container itself failed to init
+   // (e.g. buffer too small for the header).
+   bool ok = !savestate->Error;
+   if (ok)
+   {
+      NDS::DoSavestate(savestate);
+      ok = !savestate->Error;
+   }
+   delete savestate;
+
+   if (!ok)
+      log_cb(RETRO_LOG_ERROR, "retro_serialize: failed to write savestate.\n");
+   return ok;
 }
 
 bool retro_unserialize(const void *data, size_t size)
 {
-   if (NDS::ConsoleType == 0)
-   {
-      Savestate* savestate = new Savestate((void*)data, size, false);
-      NDS::DoSavestate(savestate);
-      delete savestate;
-
-      return true;
-   }
-   else
+   if (NDS::ConsoleType != 0)
    {
       log_cb(RETRO_LOG_WARN, "Savestates unsupported in DSi mode.\n");
       return false;
    }
+
+   Savestate* savestate = new Savestate((void*)data, size, false);
+
+   // The Savestate constructor validates the magic ("MELN") and the format
+   // version. A mismatch (corrupt data, or a state saved by a different core
+   // build after an app update) sets Error BEFORE any machine state is touched.
+   // Returning early here keeps a bad state from being half-applied and crashing
+   // or corrupting the running game — the frontend just reports load failure and
+   // play continues from the live state.
+   if (savestate->Error)
+   {
+      log_cb(RETRO_LOG_ERROR,
+             "retro_unserialize: incompatible or corrupt savestate (bad magic/version); not loaded.\n");
+      delete savestate;
+      return false;
+   }
+
+   NDS::DoSavestate(savestate);
+   bool ok = !savestate->Error;
+   delete savestate;
+
+   if (!ok)
+      log_cb(RETRO_LOG_ERROR, "retro_unserialize: error while restoring savestate.\n");
+   return ok;
 }
 
 void *retro_get_memory_data(unsigned type)

@@ -65,6 +65,12 @@ void DeInit()
         Platform::Thread_Free(FlushThread);
         FlushSecondaryBuffer();
     }
+#else
+    // Libretro builds do not run the background flush thread. retro_run()
+    // normally calls Flush() after a debounce, but frontend shutdown can
+    // arrive before that window expires. Force one final write so a just-made
+    // in-game save is not dropped when the core is unloaded.
+    FlushSecondaryBuffer();
 #endif
 
     if (SecondaryBuffer) delete SecondaryBuffer;
@@ -152,6 +158,8 @@ void Flush()
 
 void FlushSecondaryBuffer(u8* dst, s32 dstLength)
 {
+    if (!SecondaryBuffer || SecondaryBufferLength == 0) return;
+
     // When flushing to a file, there's no point in re-writing the exact same data.
     if (!dst && !NeedsFlush()) return;
     // When flushing to memory, we don't know if dst already has any data so we only check that we CAN flush.
