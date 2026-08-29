@@ -65,8 +65,7 @@ Savestate::Savestate(const char* filename, bool save)
     {
         Saving = true;
 #ifdef __LIBRETRO__
-        memstream_set_buffer((uint8_t*)data, size);
-        file = memstream_open(true);
+        file = memstream_open((uint8_t*)data, size, true);
         if (file == NULL)
         {
             printf("unable to create memstream for savestate\n");
@@ -95,8 +94,7 @@ Savestate::Savestate(const char* filename, bool save)
     {
         Saving = false;
 #ifdef __LIBRETRO__
-        memstream_set_buffer((uint8_t*)data, size);
-        file = memstream_open(false);
+        file = memstream_open((uint8_t*)data, size, false);
         if (file == NULL)
         {
             printf("unable to create memstream for savestate\n");
