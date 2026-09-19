@@ -1,3 +1,5 @@
+#include <cerrno>
+#include <cstdlib>
 #include <ctime>
 #include <string>
 #include <vector>
@@ -333,6 +335,29 @@ void retro_reset(void)
    NDS::LoadROM((u8*)cached_info->data, cached_info->size, save_path.c_str(), Config::DirectBoot);
 }
 
+// Core-option values arrive as strings from the frontend and may be stale,
+// user-edited or from a newer core revision. std::stoi throws on anything
+// non-numeric, and the exception unwinds through libretro's C entry points
+// straight into std::terminate. Parse defensively instead.
+static int parse_option_int(const char* value, int fallback, int lo, int hi)
+{
+   if (!value || !*value)
+      return fallback;
+
+   char* end = NULL;
+   errno = 0;
+   long parsed = strtol(value, &end, 10);
+
+   if (end == value || errno == ERANGE)
+      return fallback;
+   if (parsed < (long)lo)
+      return lo;
+   if (parsed > (long)hi)
+      return hi;
+
+   return (int)parsed;
+}
+
 static void check_variables(bool init)
 {
    struct retro_variable var = {0};
@@ -384,14 +409,14 @@ static void check_variables(bool init)
    var.key = "melonds_screen_gap";
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-        screen_layout_data.screen_gap_unscaled = std::stoi(var.value);
+        screen_layout_data.screen_gap_unscaled = parse_option_int(var.value, 0, 0, 128);
    }
 
 #ifdef HAVE_OPENGL
    var.key = "melonds_hybrid_ratio";
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value != NULL)
    {
-      screen_layout_data.hybrid_ratio = std::stoi(var.value);
+      screen_layout_data.hybrid_ratio = parse_option_int(var.value, 2, 2, 3);
    }
 #else
    screen_layout_data.hybrid_ratio = 2;
@@ -532,7 +557,7 @@ static void check_variables(bool init)
    var.key = "melonds_jit_block_size";
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-      Config::JIT_MaxBlockSize = std::stoi(var.value);
+      Config::JIT_MaxBlockSize = parse_option_int(var.value, 128, 1, 128);
 #if defined(__arm__) && !defined(__aarch64__)
       // AArch32 JIT: enforce minimum 128-instr blocks regardless of stored option
       // value. TV devices may have cached "32" from older builds. The A32 compiler

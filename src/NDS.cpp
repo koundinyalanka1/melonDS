@@ -1065,7 +1065,7 @@ u32 RunFrame()
 u32 RunFrame()
 {
 #ifdef JIT_ENABLED
-    if (Config::JIT_Enable)
+    if (Config::JIT_Enable && ARMJIT::IsAvailable())
         return NDS::ConsoleType == 1
             ? RunFrame<true, 1>()
             : RunFrame<true, 0>();

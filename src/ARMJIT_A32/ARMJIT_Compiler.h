@@ -38,6 +38,10 @@ public:
 
     bool CanCompile(bool thumb, u16 kind);
 
+    // False when the code cache could not be made executable (see the ctor).
+    // ARMJIT::Init() turns the JIT off for the session when this is false.
+    bool IsCodeMemExecutable() const { return CodeMemExecutable; }
+
     JitBlockEntry AddEntryOffset(u32 offset)
     {
         return (JitBlockEntry)(CodeStart + offset);
@@ -73,6 +77,7 @@ private:
     u8* CodeStart = nullptr;
     u8* CodePtr   = nullptr;
     u32 CodeSize  = 0;
+    bool CodeMemExecutable = false;
 
     // ── M29 Phase 7: generational code-cache wrap-around ──────────────────────
     // The code buffer is split into kCodeGenCount equal generations.  Compilation

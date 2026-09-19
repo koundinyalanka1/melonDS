@@ -248,14 +248,30 @@ Compiler::Compiler()
         u8* pageAligned = (u8*)(((u64)CodeMemory & ~(pageSize - 1)) + pageSize);
         u64 alignedSize = (((u64)CodeMemory + sizeof(CodeMemory)) & ~(pageSize - 1)) - (u64)pageAligned;
 
+    // Report failure rather than silently handing the JIT a non-executable
+    // buffer; ARMJIT::Init() falls back to the interpreter for the session.
     #ifdef _WIN32
         DWORD dummy;
-        VirtualProtect(pageAligned, alignedSize, PAGE_EXECUTE_READWRITE, &dummy);
+        CodeMemExecutable =
+            VirtualProtect(pageAligned, alignedSize, PAGE_EXECUTE_READWRITE, &dummy) != 0;
     #elif defined(__APPLE__)
-        pageAligned = (u8*)mmap(NULL, 1024*1024*32, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS ,-1, 0);
+        {
+            void* mapped = mmap(NULL, 1024*1024*32, PROT_READ | PROT_WRITE | PROT_EXEC,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            CodeMemExecutable = mapped != MAP_FAILED;
+            if (CodeMemExecutable)
+            {
+                pageAligned = (u8*)mapped;
+                alignedSize = 1024*1024*32;
+            }
+        }
     #else
-        mprotect(pageAligned, alignedSize, PROT_EXEC | PROT_READ | PROT_WRITE);
+        CodeMemExecutable =
+            mprotect(pageAligned, alignedSize, PROT_EXEC | PROT_READ | PROT_WRITE) == 0;
     #endif
+        if (!CodeMemExecutable)
+            printf("melonDS JIT: could not obtain an executable code cache -"
+                   " disabling the JIT and falling back to the interpreter\n");
 
         ResetStart = pageAligned;
         CodeMemSize = alignedSize;

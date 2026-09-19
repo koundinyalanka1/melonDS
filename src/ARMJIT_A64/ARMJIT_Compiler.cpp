@@ -32,6 +32,8 @@ extern char __start__;
 #endif
 
 #include <stdlib.h>
+#include <errno.h>
+#include <string.h>
 
 using namespace Arm64Gen;
 
@@ -256,16 +258,36 @@ Compiler::Compiler()
 
     SetCodeBase((u8*)JitRWStart, (u8*)JitRXStart);
     JitMemMainSize = JitMemSize;
+    CodeMemExecutable = true;
 #else
     u64 pageSize = sysconf(_SC_PAGE_SIZE);
     u8* pageAligned = (u8*)(((u64)JitMem & ~(pageSize - 1)) + pageSize);
     u64 alignedSize = (((u64)JitMem + sizeof(JitMem)) & ~(pageSize - 1)) - (u64)pageAligned;
+    // The result of these used to be ignored entirely. When the platform denies
+    // an executable mapping (hardened ROMs / MDM-restricted SELinux contexts on
+    // Android, or a missing dynamic-codesigning entitlement on Apple) the JIT
+    // would take a non-executable buffer and crash on the first dispatch with no
+    // diagnostic. Report it instead; ARMJIT::Init() then falls back to the
+    // interpreter for the session.
     #ifdef __APPLE__
-        pageAligned = (u8*)mmap(NULL, 1024*1024*16, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT,-1, 0);
-        JitEnableWrite();
+        {
+            void* mapped = mmap(NULL, 1024*1024*16, PROT_READ | PROT_WRITE | PROT_EXEC,
+                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+            CodeMemExecutable = mapped != MAP_FAILED;
+            if (CodeMemExecutable)
+            {
+                pageAligned = (u8*)mapped;
+                alignedSize = 1024*1024*16;
+                JitEnableWrite();
+            }
+        }
     #else
-        mprotect(pageAligned, alignedSize, PROT_EXEC | PROT_READ | PROT_WRITE);
+        CodeMemExecutable =
+            mprotect(pageAligned, alignedSize, PROT_EXEC | PROT_READ | PROT_WRITE) == 0;
     #endif
+    if (!CodeMemExecutable)
+        printf("melonDS JIT: could not obtain an executable code cache (%s) -"
+               " disabling the JIT and falling back to the interpreter\n", strerror(errno));
 
     SetCodeBase(pageAligned, pageAligned);
     JitMemMainSize = alignedSize;

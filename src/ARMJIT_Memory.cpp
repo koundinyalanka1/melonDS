@@ -710,17 +710,84 @@ bool FaultHandler(FaultDescription& faultDesc)
 
 const u64 AddrSpaceSize = 0x100000000;
 
-void Init()
+// See IsFastMemAvailable() in the header for why this is a runtime decision.
+// Probed lazily and cached: the libretro frontend calls check_variables() -- and
+// therefore IsFastMemAvailable() -- before NDS::Init() reaches ARMJIT_Memory::Init(),
+// so an eagerly-initialised flag would report "no fastmem" on every host.
+// -1 = not probed yet.
+static int FastMemAvailableCache = -1;
+
+static bool DetectFastMemSupport()
 {
 #if defined(ARMJIT_A32_NO_FASTMEM)
-    FastMem9Start = nullptr;
-    FastMem7Start = nullptr;
-    MemoryFile = -1;
-    MemoryBase = (u8*)mmap(NULL, MemoryTotalSize, PROT_READ | PROT_WRITE,
-                           MAP_ANON | MAP_PRIVATE, -1, 0);
-    assert(MemoryBase != MAP_FAILED);
-    u8* basePtr = MemoryBase;
-#elif defined(__SWITCH__)
+    // 32-bit host: no room for the 2x4 GB reservation.
+    return false;
+#elif defined(__SWITCH__) || defined(_WIN32)
+    // Both use their own allocator with its own granularity handling.
+    return true;
+#else
+    // 16 KB-page hosts (Android 15+ on arm64, some arm64 Linux kernels) cannot
+    // map or protect the 4 KB guest pages fastmem is built around. Asserts are
+    // compiled out in release, so without this check the mmap failures are
+    // silent and -- worse -- SetCodeProtection silently stops write-protecting
+    // code pages, which breaks self-modifying-code detection and lets stale JIT
+    // blocks execute.
+    long pageSize = sysconf(_SC_PAGE_SIZE);
+    if (pageSize <= 0 || (unsigned long)pageSize > 0x1000)
+    {
+        printf("melonDS JIT: host page size is %ld, fastmem needs 4096 -"
+               " using slow-path memory access for this session\n", pageSize);
+        return false;
+    }
+    return true;
+#endif
+}
+
+bool IsFastMemAvailable()
+{
+    if (FastMemAvailableCache < 0)
+        FastMemAvailableCache = DetectFastMemSupport() ? 1 : 0;
+    return FastMemAvailableCache != 0;
+}
+
+void Init()
+{
+    const bool fastMem = IsFastMemAvailable();
+
+#if !defined(_WIN32) && !defined(__SWITCH__)
+    if (!fastMem)
+    {
+        FastMem9Start = nullptr;
+        FastMem7Start = nullptr;
+        MemoryFile = -1;
+        MemoryBase = (u8*)mmap(NULL, MemoryTotalSize, PROT_READ | PROT_WRITE,
+                               MAP_ANON | MAP_PRIVATE, -1, 0);
+        if (MemoryBase == MAP_FAILED)
+        {
+            printf("melonDS JIT: failed to allocate %u bytes of emulated memory\n",
+                   (unsigned)MemoryTotalSize);
+            MemoryBase = nullptr;
+        }
+
+        u8* basePtr = MemoryBase;
+        NDS::MainRAM = basePtr + MemBlockMainRAMOffset;
+        NDS::SharedWRAM = basePtr + MemBlockSWRAMOffset;
+        NDS::ARM7WRAM = basePtr + MemBlockARM7WRAMOffset;
+        NDS::ARM9->DTCM = basePtr + MemBlockDTCMOffset;
+        DSi::NWRAM_A = basePtr + MemBlockNWRAM_AOffset;
+        DSi::NWRAM_B = basePtr + MemBlockNWRAM_BOffset;
+        DSi::NWRAM_C = basePtr + MemBlockNWRAM_COffset;
+        return;
+    }
+#endif
+
+#if !defined(ARMJIT_A32_NO_FASTMEM)
+// On a 32-bit host IsFastMemAvailable() is always false, so the branch above has
+// already returned. Exclude the rest from the build entirely: the 2x4 GB
+// reservation below cannot be expressed in a 32-bit size_t, and compiling it
+// anyway truncates AddrSpaceSize*4 to 0.
+
+#if defined(__SWITCH__)
     MemoryBase = (u8*)aligned_alloc(0x1000, MemoryTotalSize);
     virtmemLock();
     MemoryBaseCodeMem = (u8*)virtmemFindCodeMemory(MemoryTotalSize, 0x1000);
@@ -827,6 +894,7 @@ void Init()
     DSi::NWRAM_A = basePtr + MemBlockNWRAM_AOffset;
     DSi::NWRAM_B = basePtr + MemBlockNWRAM_BOffset;
     DSi::NWRAM_C = basePtr + MemBlockNWRAM_COffset;
+#endif // !ARMJIT_A32_NO_FASTMEM
 }
 
 void DeInit()
@@ -844,9 +912,16 @@ void DeInit()
     CloseHandle(MemoryFile);
 
     RemoveVectoredExceptionHandler(ExceptionHandlerHandle);
-#elif defined(ARMJIT_A32_NO_FASTMEM)
-    munmap(MemoryBase, MemoryTotalSize);
 #else
+    if (!IsFastMemAvailable())
+    {
+        if (MemoryBase)
+            munmap(MemoryBase, MemoryTotalSize);
+        MemoryBase = nullptr;
+        return;
+    }
+
+#if !defined(ARMJIT_A32_NO_FASTMEM)
     sigaction(SIGSEGV, &OldSaSegv, nullptr);
 #ifdef __APPLE__
     sigaction(SIGBUS, &OldSaBus, nullptr);
@@ -854,6 +929,7 @@ void DeInit()
 
     munmap(MemoryBase, MemoryTotalSize);
     close(MemoryFile);
+#endif
 #endif
 }
 
@@ -976,6 +1052,13 @@ static bool FastMemLitePageHasCode(u32 num, int region, u32 pageStart)
 
 void FastMemLiteRebuild()
 {
+    // Only the AArch32 backend emits FastMemLite lookups; every other backend
+    // uses mmap-backed fastmem or the plain helpers and never reads these tables.
+    // Rebuilding them elsewhere walked 2x4096 pages (each probing 32 AddressRanges)
+    // from SetCodeProtection() on every code-page transition, for nothing.
+#if !(defined(__arm__) && !defined(__aarch64__))
+    return;
+#else
     if (!NDS::ARM9 || !NDS::MainRAM)
     {
         memset(FastMemLiteRead, 0, sizeof(FastMemLiteRead));
@@ -1010,14 +1093,14 @@ void FastMemLiteRebuild()
         printf("melonDS A32 fastmem-lite: page tables rebuilt (#%u)\n",
                FastMemLiteRebuildCount);
 #endif
+#endif // AArch32 host
 }
 
 bool IsFastmemCompatible(int region)
 {
-#if defined(ARMJIT_A32_NO_FASTMEM)
-    (void)region;
-    return false;
-#else
+    if (!IsFastMemAvailable())
+        return false;
+
 #ifdef _WIN32
     /*
         TODO: with some hacks, the smaller shared WRAM regions
@@ -1030,7 +1113,6 @@ bool IsFastmemCompatible(int region)
         return false;
 #endif
     return OffsetsPerRegion[region] != UINT32_MAX;
-#endif
 }
 
 bool GetMirrorLocation(int region, u32 num, u32 addr, u32& memoryOffset, u32& mirrorStart, u32& mirrorSize)

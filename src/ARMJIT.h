@@ -36,6 +36,12 @@ typedef void (*JitBlockEntry)();
 void Init();
 void DeInit();
 
+// False when the code cache could not be made executable at Init() time, so the
+// JIT must not be entered at all this session. NDS::RunFrame() checks this
+// alongside Config::JIT_Enable -- the core option alone is not enough, because
+// the libretro frontend re-reads it whenever options change.
+bool IsAvailable();
+
 void Reset();
 
 void CheckAndInvalidateITCM();

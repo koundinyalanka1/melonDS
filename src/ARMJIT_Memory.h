@@ -68,6 +68,18 @@ u32 LocaliseAddress(int region, u32 num, u32 addr);
 
 bool IsFastmemCompatible(int region);
 
+// True when the host can actually back the fastmem address space.
+//
+// Fastmem needs page-granular control over 4 KB *guest* pages: MapAtAddress
+// splits a mirror around the DTCM window and SetCodeProtection flips a single
+// 0x1000 page, both at 4 KB offsets into the shared memory object. A host whose
+// page size is larger than 4 KB cannot express that -- mmap/mprotect reject the
+// unaligned address/offset with EINVAL -- and a 32-bit host has nowhere to put
+// the 2x4 GB reservation. Resolved once in Init(); false makes the JIT emit only
+// slow-path memory helpers, which is the same configuration armeabi-v7a already
+// ships and which invalidates self-modifying code via SlowWrite -> CheckAndInvalidate.
+bool IsFastMemAvailable();
+
 void RemapDTCM(u32 newBase, u32 newSize);
 void RemapSWRAM();
 void RemapNWRAM(int num);

@@ -236,6 +236,11 @@ public:
     bool IsJITFault(u8* pc);
     u8* RewriteMemAccess(u8* pc);
 
+    // False when the code cache could not be made executable (see the ctor).
+    // ARMJIT::Init() turns the JIT off for the session when this is false.
+    bool IsCodeMemExecutable() const { return CodeMemExecutable; }
+    bool CodeMemExecutable = false;
+
     void SwapCodeRegion()
     {
         ptrdiff_t offset = GetCodeOffset();

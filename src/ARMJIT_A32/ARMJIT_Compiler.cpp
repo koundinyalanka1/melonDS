@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <assert.h>
+#include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -89,6 +90,13 @@ const bool EnableCodeCacheWrap = true;
 // DTCM-overlap correctness and SMC store protection are baked into the tables at
 // rebuild time (see ARMJIT_Memory.h), so the emitted sequence needs no per-region
 // guards.  Runtime-gated on Config::JIT_FastMemory (melonds_jit_fast_memory).
+//
+// NOTE: this is a pure *software* page table in our own .bss -- it has nothing to
+// do with ARMJIT_Memory::IsFastMemAvailable(), which reports whether the host can
+// back the mmap-based fastmem address space the A64/x64 backends use. Do not gate
+// this on IsFastMemAvailable(): it is false on every 32-bit host by definition,
+// which would disable this path entirely on armeabi-v7a.
+//
 // Flip false to restore the M17/M28 candidate guard chains unchanged.
 const bool EnableFastMemLitePageTable = true;
 // M31: cross-block direct linking (generalised M18 self-link) — unconditional
@@ -3794,8 +3802,17 @@ Compiler::Compiler()
     u8* pageAligned = (u8*)(((u64)JitMem + pageSize - 1) & ~(pageSize - 1));
     u64 alignedSize = (((u64)JitMem + sizeof(JitMem)) & ~(pageSize - 1)) - (u64)pageAligned;
 
-    int ok = mprotect(pageAligned, alignedSize, PROT_EXEC | PROT_READ | PROT_WRITE);
-    assert(ok == 0);
+    // A plain assert() here is a no-op in release (-DNDEBUG), so a denied
+    // mprotect used to hand the JIT a non-executable buffer and crash on the
+    // first dispatch with no diagnostic. Some hardened ROMs and MDM-restricted
+    // contexts deny `execmem` to untrusted apps; on those we must fall back to
+    // the interpreter instead of dying.
+    CodeMemExecutable =
+        mprotect(pageAligned, alignedSize, PROT_EXEC | PROT_READ | PROT_WRITE) == 0;
+    if (!CodeMemExecutable)
+        A32JIT_LOGI("melonDS JIT: mprotect(RWX) on the code cache failed (%s) -"
+                    " disabling the JIT and falling back to the interpreter",
+                    strerror(errno));
 
     CodeStart = pageAligned;
     CodePtr = CodeStart;

@@ -232,6 +232,11 @@ public:
 
     bool IsJITFault(u8* addr);
 
+    // False when the code cache could not be made executable (see the ctor).
+    // ARMJIT::Init() turns the JIT off for the session when this is false.
+    bool IsCodeMemExecutable() const { return CodeMemExecutable; }
+    bool CodeMemExecutable = false;
+
     u8* RewriteMemAccess(u8* pc);
 
 #ifdef JIT_PROFILING_ENABLED

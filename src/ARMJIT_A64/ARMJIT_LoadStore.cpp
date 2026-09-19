@@ -188,7 +188,8 @@ void Compiler::Comp_MemAccess(int rd, int rn, Op2 offset, int size, int flags)
         ? ARMJIT_Memory::ClassifyAddress9(addrIsStatic ? staticAddress : CurInstr.DataRegion)
         : ARMJIT_Memory::ClassifyAddress7(addrIsStatic ? staticAddress : CurInstr.DataRegion);
 
-    if (Config::JIT_FastMemory && ((!Thumb && CurInstr.Cond() != 0xE) || ARMJIT_Memory::IsFastmemCompatible(expectedTarget)))
+    if (Config::JIT_FastMemory && ARMJIT_Memory::IsFastMemAvailable()
+        && ((!Thumb && CurInstr.Cond() != 0xE) || ARMJIT_Memory::IsFastmemCompatible(expectedTarget)))
     {
         ptrdiff_t memopStart = GetCodeOffset();
         LoadStorePatch patch;
@@ -497,7 +498,7 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
         ? ARMJIT_Memory::ClassifyAddress9(CurInstr.DataRegion)
         : ARMJIT_Memory::ClassifyAddress7(CurInstr.DataRegion);
 
-    bool compileFastPath = Config::JIT_FastMemory
+    bool compileFastPath = Config::JIT_FastMemory && ARMJIT_Memory::IsFastMemAvailable()
         && store && !usermode && (CurInstr.Cond() < 0xE || ARMJIT_Memory::IsFastmemCompatible(expectedTarget));
 
     {

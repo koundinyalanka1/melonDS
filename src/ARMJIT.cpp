@@ -311,9 +311,20 @@ void SlowBlockTransfer7(u32 addr, u64* data, u32 num)
 INSTANTIATE_SLOWMEM(0)
 INSTANTIATE_SLOWMEM(1)
 
+static bool JitUsable = true;
+
+bool IsAvailable()
+{
+    return JitUsable;
+}
+
 void Init()
 {
     JITCompiler = new Compiler();
+
+    JitUsable = JITCompiler->IsCodeMemExecutable();
+    if (!JitUsable)
+        Config::JIT_Enable = false;
 
     ARMJIT_Memory::Init();
 }

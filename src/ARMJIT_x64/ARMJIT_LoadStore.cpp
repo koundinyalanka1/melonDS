@@ -200,7 +200,8 @@ void Compiler::Comp_MemAccess(int rd, int rn, const Op2& op2, int size, int flag
         ? ARMJIT_Memory::ClassifyAddress9(CurInstr.DataRegion)
         : ARMJIT_Memory::ClassifyAddress7(CurInstr.DataRegion);
 
-    if (Config::JIT_FastMemory && ((!Thumb && CurInstr.Cond() != 0xE) || ARMJIT_Memory::IsFastmemCompatible(expectedTarget)))
+    if (Config::JIT_FastMemory && ARMJIT_Memory::IsFastMemAvailable()
+        && ((!Thumb && CurInstr.Cond() != 0xE) || ARMJIT_Memory::IsFastmemCompatible(expectedTarget)))
     {
         if (rdMapped.IsImm())
         {
@@ -431,7 +432,7 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
     else
         Comp_AddCycles_CD();
 
-    bool compileFastPath = Config::JIT_FastMemory
+    bool compileFastPath = Config::JIT_FastMemory && ARMJIT_Memory::IsFastMemAvailable()
         && !usermode && (CurInstr.Cond() < 0xE || ARMJIT_Memory::IsFastmemCompatible(expectedTarget));
 
     // we need to make sure that the stack stays aligned to 16 bytes

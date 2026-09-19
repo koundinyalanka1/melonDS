@@ -5,6 +5,16 @@ MELON_DIR    := $(ROOT_DIR)/src
 CORE_DIR     := $(MELON_DIR)/libretro
 JIT_ARCH     :=
 HAVE_THREADS := 1
+
+# YAGE: reset DEFINES before including Makefile.common.
+#
+# ndk-build re-evaluates this file once per ABI, but Makefile.common appends to
+# DEFINES with += and never resets it, so defines leaked from one ABI's pass into
+# the next. With APP_ABI := all that meant the x86 pass (no JIT_ARCH, so no ARMJIT
+# sources) still inherited -DJIT_ENABLED from the preceding x86_64 pass and failed
+# to link with undefined ARMJIT::* symbols. SOURCES_*/INCFLAGS already use := in
+# Makefile.common; DEFINES is the only one that accumulated.
+DEFINES      :=
 # YAGE: OpenGL renderer enabled for the Android/GLES3 build.
 HAVE_OPENGL := 1
 
